@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.0.0
+// @version      1.1.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -315,14 +315,27 @@
     // QBITTORRENT API
     // ============================================
 
-    function qbitRequest(endpoint, method, data, headers = {}) {
+    function qbitRequest(endpoint, method, data, headers = {}, isLogin = false) {
         return new Promise((resolve, reject) => {
             const url = `${CONFIG.qbittorrent.url}${endpoint}`;
+
+            // Build headers with CSRF protection bypass
+            // qBittorrent checks Referer and Origin headers for CSRF protection
+            const requestHeaders = {
+                'Referer': CONFIG.qbittorrent.url + '/',
+                'Origin': CONFIG.qbittorrent.url,
+                ...headers
+            };
+
+            // Add session cookie if we have one (for authenticated requests)
+            if (qbitSessionId && !isLogin) {
+                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
+            }
 
             GM_xmlhttpRequest({
                 method: method,
                 url: url,
-                headers: headers,
+                headers: requestHeaders,
                 data: data,
                 withCredentials: true,
                 onload: function(response) {
@@ -343,7 +356,8 @@
                 '/api/v2/auth/login',
                 'POST',
                 formData,
-                { 'Content-Type': 'application/x-www-form-urlencoded' }
+                { 'Content-Type': 'application/x-www-form-urlencoded' },
+                true // isLogin flag
             );
 
             if (response.status === 200 && response.responseText === 'Ok.') {
@@ -352,6 +366,9 @@
                 const sidMatch = cookies.match(/SID=([^;]+)/i);
                 if (sidMatch) {
                     qbitSessionId = sidMatch[1];
+                    // Store session in GM storage for persistence
+                    GM_setValue('qbit_session', qbitSessionId);
+                    console.log('qBittorrent: Login successful, SID obtained');
                 }
                 return true;
             } else if (response.status === 403) {
@@ -359,6 +376,7 @@
                 return false;
             } else {
                 showToast('qBittorrent: Invalid username or password', 'error');
+                console.log('qBittorrent login failed:', response.status, response.responseText);
                 return false;
             }
         } catch (error) {
@@ -369,20 +387,31 @@
     }
 
     async function ensureAuthenticated() {
+        // Try to restore session from storage
+        if (!qbitSessionId) {
+            qbitSessionId = GM_getValue('qbit_session', null);
+        }
+
         // Check if we're already authenticated by making a simple API call
-        try {
-            const response = await qbitRequest('/api/v2/app/version', 'GET', null);
-            if (response.status === 200) {
-                return true;
+        if (qbitSessionId) {
+            try {
+                const response = await qbitRequest('/api/v2/app/version', 'GET', null);
+                if (response.status === 200) {
+                    return true;
+                }
+                // Session expired, clear it
+                qbitSessionId = null;
+                GM_setValue('qbit_session', null);
+            } catch (e) {
+                // Not authenticated, proceed to login
+                qbitSessionId = null;
             }
-        } catch (e) {
-            // Not authenticated, proceed to login
         }
 
         return await qbitLogin();
     }
 
-    async function addTorrentByUrl(url, torrentName = '') {
+    async function addTorrentByUrl(url, torrentName = '', retryCount = 0) {
         if (!await ensureAuthenticated()) {
             return false;
         }
@@ -434,8 +463,15 @@
             } else if (response.status === 415) {
                 showToast('qBittorrent: Torrent file is not valid', 'error');
                 return false;
+            } else if (response.status === 403 && retryCount < 1) {
+                // Session might have expired or CSRF issue - force re-login and retry
+                console.log('qBittorrent: Got 403, forcing re-login...');
+                qbitSessionId = null;
+                GM_setValue('qbit_session', null);
+                return await addTorrentByUrl(url, torrentName, retryCount + 1);
             } else {
                 showToast(`qBittorrent: Failed to add torrent (${response.status})`, 'error');
+                console.log('qBittorrent add torrent failed:', response.status, response.responseText, response.responseHeaders);
                 return false;
             }
         } catch (error) {
@@ -445,7 +481,7 @@
         }
     }
 
-    async function addTorrentByFile(fileBlob, fileName) {
+    async function addTorrentByFile(fileBlob, fileName, retryCount = 0) {
         if (!await ensureAuthenticated()) {
             return false;
         }
@@ -502,8 +538,15 @@
             if (response.status === 200 && response.responseText === 'Ok.') {
                 showToast(`Added: ${fileName}`, 'success');
                 return true;
+            } else if (response.status === 403 && retryCount < 1) {
+                // Session might have expired or CSRF issue - force re-login and retry
+                console.log('qBittorrent: Got 403, forcing re-login...');
+                qbitSessionId = null;
+                GM_setValue('qbit_session', null);
+                return await addTorrentByFile(fileBlob, fileName, retryCount + 1);
             } else {
                 showToast(`qBittorrent: Failed to add torrent (${response.status})`, 'error');
+                console.log('qBittorrent upload failed:', response.status, response.responseText);
                 return false;
             }
         } catch (error) {
@@ -709,10 +752,25 @@
                 const response = await qbitRequest('/api/v2/app/version', 'GET', null);
                 if (response.status === 200) {
                     showToast(`Connected to qBittorrent ${response.responseText}`, 'success');
+                } else {
+                    showToast(`Connection issue: HTTP ${response.status}`, 'error');
+                    console.log('qBittorrent test response:', response);
                 }
             } catch (e) {
                 showToast('Connected but could not get version', 'info');
+                console.error('qBittorrent test error:', e);
             }
+        }
+    });
+
+    GM_registerMenuCommand('🔄 Force Re-login', async () => {
+        // Clear stored session
+        qbitSessionId = null;
+        GM_setValue('qbit_session', null);
+        showToast('Session cleared, logging in...', 'info');
+        const success = await qbitLogin();
+        if (success) {
+            showToast('Re-login successful!', 'success');
         }
     });
 
