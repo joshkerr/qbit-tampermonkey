@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.6.0
+// @version      1.7.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -315,7 +315,7 @@
     // QBITTORRENT API
     // ============================================
 
-    // Detect Safari/iPadOS for using native fetch (better cookie handling)
+    // Detect Safari/iPadOS (for informational purposes and special handling)
     // iPadOS in desktop mode reports as Macintosh, so we check multiple signals
     const isSafari = (() => {
         const ua = navigator.userAgent;
@@ -328,10 +328,79 @@
     })();
 
     // Force fetch mode - can be toggled via menu for troubleshooting
+    // NOTE: Fetch mode is OFF by default because it's blocked by CORS
+    // GM_xmlhttpRequest bypasses CORS restrictions
     let forceFetchMode = GM_getValue('qbit_force_fetch', false);
 
-    // Determine if we should use fetch
-    const shouldUseFetch = () => isSafari || forceFetchMode;
+    // Determine if we should use fetch - now OFF by default (requires explicit opt-in)
+    const shouldUseFetch = () => forceFetchMode;
+
+    // Track if we've shown the Safari session helper
+    let safariSessionPopup = null;
+    let safariSessionEstablished = GM_getValue('qbit_safari_session', false);
+
+    // Helper to establish session on Safari/iPadOS by opening qBittorrent in a popup
+    async function establishSafariSession() {
+        return new Promise((resolve) => {
+            const popupWidth = 600;
+            const popupHeight = 500;
+            const left = (screen.width - popupWidth) / 2;
+            const top = (screen.height - popupHeight) / 2;
+
+            showToast('Opening qBittorrent to establish session...', 'info');
+
+            safariSessionPopup = window.open(
+                CONFIG.qbittorrent.url,
+                'qbit_session',
+                `width=${popupWidth},height=${popupHeight},left=${left},top=${top},resizable=yes`
+            );
+
+            if (!safariSessionPopup) {
+                showToast('Popup blocked! Please allow popups for this site.', 'error');
+                resolve(false);
+                return;
+            }
+
+            // Show instructions
+            showModal(
+                '🔑 Establish qBittorrent Session',
+                `<p>A popup window has opened to qBittorrent.</p>
+                 <p><strong>Instructions:</strong></p>
+                 <ol style="margin: 10px 0; padding-left: 20px;">
+                   <li>Log in to qBittorrent in the popup</li>
+                   <li>Once logged in, click "Done" below</li>
+                 </ol>
+                 <p style="color: #888; font-size: 12px;">This establishes browser cookies needed for Safari/iPadOS.</p>`,
+                () => {
+                    // User clicked Done
+                    if (safariSessionPopup && !safariSessionPopup.closed) {
+                        safariSessionPopup.close();
+                    }
+                    safariSessionPopup = null;
+                    safariSessionEstablished = true;
+                    GM_setValue('qbit_safari_session', true);
+                    showToast('Session established! Retrying...', 'success');
+                    resolve(true);
+                },
+                () => {
+                    // User clicked Cancel
+                    if (safariSessionPopup && !safariSessionPopup.closed) {
+                        safariSessionPopup.close();
+                    }
+                    safariSessionPopup = null;
+                    resolve(false);
+                }
+            );
+
+            // Change button text
+            setTimeout(() => {
+                const confirmBtn = document.getElementById('qbit-confirm');
+                if (confirmBtn) {
+                    confirmBtn.textContent = 'Done - I\'m logged in';
+                }
+            }, 100);
+        });
+    }
 
     // Use native fetch for qBittorrent API (better cookie handling on Safari/iPadOS)
     // Note: Requires CSRF protection disabled in qBittorrent for Safari/iPadOS
@@ -412,7 +481,7 @@
         }
     }
 
-    async function qbitLogin() {
+    async function qbitLogin(offerSafariHelper = true) {
         try {
             const formData = `username=${encodeURIComponent(CONFIG.qbittorrent.username)}&password=${encodeURIComponent(CONFIG.qbittorrent.password)}`;
 
@@ -437,6 +506,8 @@
                         console.log('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
                     } else {
                         console.warn('qBittorrent: Login succeeded but no SID cookie found in response');
+                        // Even without explicit SID, mark as logged in (server may use different auth)
+                        qbitSessionId = 'no-sid-cookie';
                     }
                 } else {
                     // On Safari, mark as authenticated (browser handles cookie)
@@ -445,7 +516,17 @@
                 }
                 return true;
             } else if (response.status === 403) {
-                showToast('qBittorrent: Too many failed login attempts. Try again later.', 'error');
+                console.log('qBittorrent: 403 on login - may be CSRF or cookie issue');
+                // On Safari, 403 might be due to cookie/CORS issues
+                if (isSafari && offerSafariHelper) {
+                    console.log('qBittorrent: Safari detected, offering session helper');
+                    const established = await establishSafariSession();
+                    if (established) {
+                        // Retry login after session established
+                        return await qbitLogin(false);
+                    }
+                }
+                showToast('qBittorrent: Access denied (403). Try "Establish Session" from menu.', 'error');
                 return false;
             } else {
                 showToast('qBittorrent: Invalid username or password', 'error');
@@ -453,8 +534,16 @@
                 return false;
             }
         } catch (error) {
-            showToast('qBittorrent: Connection failed. Check your settings.', 'error');
             console.error('qBittorrent login error:', error);
+            // On Safari, network errors might be CORS issues
+            if (isSafari && offerSafariHelper) {
+                console.log('qBittorrent: Safari connection error, offering session helper');
+                const established = await establishSafariSession();
+                if (established) {
+                    return await qbitLogin(false);
+                }
+            }
+            showToast('qBittorrent: Connection failed. Check your settings.', 'error');
             return false;
         }
     }
@@ -945,20 +1034,21 @@
         window.open(CONFIG.qbittorrent.url, '_blank');
     });
 
-    GM_registerMenuCommand(`🔀 Toggle Fetch Mode (currently: ${forceFetchMode ? 'ON' : 'AUTO'})`, () => {
+    GM_registerMenuCommand(`🔀 Toggle Fetch Mode (currently: ${forceFetchMode ? 'ON' : 'OFF'})`, () => {
         forceFetchMode = !forceFetchMode;
         GM_setValue('qbit_force_fetch', forceFetchMode);
-        showToast(`Fetch mode: ${forceFetchMode ? 'FORCED ON' : 'AUTO (Safari detection)'}. Reload page to apply.`, 'info');
-        console.log('qBittorrent: Fetch mode set to:', forceFetchMode ? 'FORCED ON' : 'AUTO');
+        showToast(`Fetch mode: ${forceFetchMode ? 'ON (uses CORS)' : 'OFF (uses GM_xmlhttpRequest)'}. Reload page to apply.`, 'info');
+        console.log('qBittorrent: Fetch mode set to:', forceFetchMode ? 'ON' : 'OFF');
     });
 
-    // Safari/iPadOS: Open qBittorrent to establish session cookies
-    if (shouldUseFetch()) {
-        GM_registerMenuCommand('🔑 Open qBittorrent (establish session)', () => {
-            showToast('Opening qBittorrent... Log in if needed, then return here.', 'info');
-            window.open(CONFIG.qbittorrent.url, '_blank');
-        });
-    }
+    // Always show establish session option - useful for Safari/iPadOS cookie issues
+    GM_registerMenuCommand('🔑 Establish Session (Safari/iPadOS)', async () => {
+        const established = await establishSafariSession();
+        if (established) {
+            // Try to authenticate after session established
+            await ensureAuthenticated();
+        }
+    });
 
     // ============================================
     // INITIALIZATION
@@ -981,14 +1071,20 @@
         console.log('qBittorrent Torrent Interceptor loaded');
         console.log('Browser detection:', isSafari ? 'Safari/iPadOS' : 'Other browser');
         console.log('Touch points:', navigator.maxTouchPoints);
-        console.log('Fetch mode:', forceFetchMode ? 'FORCED ON' : 'AUTO');
-        console.log('Using:', shouldUseFetch() ? 'fetch API' : 'GM_xmlhttpRequest');
+        console.log('Fetch mode:', forceFetchMode ? 'ON' : 'OFF');
+        console.log('Using:', shouldUseFetch() ? 'fetch API (CORS required)' : 'GM_xmlhttpRequest (CORS bypass)');
+
+        if (isSafari) {
+            console.log('%c📱 Safari/iPadOS detected', 'color: #007aff; font-weight: bold');
+            console.log('  Using GM_xmlhttpRequest to bypass CORS restrictions.');
+            console.log('  If you experience 403 errors, use the "Establish Session" menu option.');
+        }
 
         if (shouldUseFetch()) {
-            console.log('%c⚠️ Using fetch API - you need to configure qBittorrent:', 'color: orange; font-weight: bold');
+            console.log('%c⚠️ Fetch mode enabled - CORS required:', 'color: orange; font-weight: bold');
             console.log('  1. Open qBittorrent Web UI → Options → Web UI');
             console.log('  2. Disable "Enable Cross-Site Request Forgery (CSRF) protection"');
-            console.log('  3. Add your domain to "Server domains" (e.g., *)');
+            console.log('  3. Configure reverse proxy CORS headers if using one');
         }
     }
 
