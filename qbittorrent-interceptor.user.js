@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.2.0
+// @version      1.3.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -327,24 +327,33 @@
                 ...headers
             };
 
-            // Add session cookie if we have one (for authenticated requests)
-            if (qbitSessionId && !isLogin) {
-                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
-            }
-
-            GM_xmlhttpRequest({
+            // Build request options
+            const requestOptions = {
                 method: method,
                 url: url,
                 headers: requestHeaders,
                 data: data,
                 withCredentials: true,
+                anonymous: false, // Ensure cookies are sent
                 onload: function(response) {
                     resolve(response);
                 },
                 onerror: function(error) {
                     reject(error);
                 }
-            });
+            };
+
+            // Add session cookie if we have one (for authenticated requests)
+            // Use 'cookie' property for better cross-platform support (iPadOS/Safari)
+            if (qbitSessionId && !isLogin) {
+                // Try both methods for maximum compatibility
+                requestOptions.cookie = `SID=${qbitSessionId}`;
+                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
+            }
+
+            console.log(`qBittorrent API: ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+
+            GM_xmlhttpRequest(requestOptions);
         });
     }
 
@@ -363,12 +372,15 @@
             if (response.status === 200 && response.responseText === 'Ok.') {
                 // Extract SID cookie from response headers
                 const cookies = response.responseHeaders;
+                console.log('qBittorrent: Login response headers:', cookies);
                 const sidMatch = cookies.match(/SID=([^;]+)/i);
                 if (sidMatch) {
                     qbitSessionId = sidMatch[1];
                     // Store session in GM storage for persistence
                     GM_setValue('qbit_session', qbitSessionId);
-                    console.log('qBittorrent: Login successful, SID obtained');
+                    console.log('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
+                } else {
+                    console.warn('qBittorrent: Login succeeded but no SID cookie found in response');
                 }
                 return true;
             } else if (response.status === 403) {
@@ -577,24 +589,31 @@
                 'Content-Type': `multipart/form-data; boundary=${boundary}`
             };
 
-            if (qbitSessionId) {
-                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
-            }
-
-            GM_xmlhttpRequest({
+            const requestOptions = {
                 method: 'POST',
                 url: url,
                 headers: requestHeaders,
                 data: binaryData.buffer,
                 binary: true,
                 withCredentials: true,
+                anonymous: false,
                 onload: function(response) {
                     resolve(response);
                 },
                 onerror: function(error) {
                     reject(error);
                 }
-            });
+            };
+
+            // Add session cookie using both methods for compatibility
+            if (qbitSessionId) {
+                requestOptions.cookie = `SID=${qbitSessionId}`;
+                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
+            }
+
+            console.log('qBittorrent API: POST (binary)', endpoint, `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+
+            GM_xmlhttpRequest(requestOptions);
         });
     }
 
@@ -788,15 +807,21 @@
 
     GM_registerMenuCommand('🔌 Test Connection', async () => {
         showToast('Testing connection...', 'info');
+        console.log('qBittorrent: Starting connection test...');
+        console.log('qBittorrent: Current SID:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
+
         const success = await ensureAuthenticated();
+        console.log('qBittorrent: Auth result:', success, 'SID after auth:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
+
         if (success) {
             try {
                 const response = await qbitRequest('/api/v2/app/version', 'GET', null);
+                console.log('qBittorrent: Test response:', response.status, response.responseText);
                 if (response.status === 200) {
                     showToast(`Connected to qBittorrent ${response.responseText}`, 'success');
                 } else {
                     showToast(`Connection issue: HTTP ${response.status}`, 'error');
-                    console.log('qBittorrent test response:', response);
+                    console.log('qBittorrent test failed - full response:', response);
                 }
             } catch (e) {
                 showToast('Connected but could not get version', 'info');
