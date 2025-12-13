@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.5.0
+// @version      1.6.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -951,6 +951,14 @@
         showToast(`Fetch mode: ${forceFetchMode ? 'FORCED ON' : 'AUTO (Safari detection)'}. Reload page to apply.`, 'info');
         console.log('qBittorrent: Fetch mode set to:', forceFetchMode ? 'FORCED ON' : 'AUTO');
     });
+
+    // Safari/iPadOS: Open qBittorrent to establish session cookies
+    if (shouldUseFetch()) {
+        GM_registerMenuCommand('🔑 Open qBittorrent (establish session)', () => {
+            showToast('Opening qBittorrent... Log in if needed, then return here.', 'info');
+            window.open(CONFIG.qbittorrent.url, '_blank');
+        });
+    }
 
     // ============================================
     // INITIALIZATION
