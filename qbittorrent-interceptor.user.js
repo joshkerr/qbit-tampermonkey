@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.4.0
+// @version      1.5.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -316,8 +316,22 @@
     // ============================================
 
     // Detect Safari/iPadOS for using native fetch (better cookie handling)
-    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) ||
-                     /iPad|iPhone|iPod/.test(navigator.userAgent);
+    // iPadOS in desktop mode reports as Macintosh, so we check multiple signals
+    const isSafari = (() => {
+        const ua = navigator.userAgent;
+        const isIOS = /iPad|iPhone|iPod/.test(ua);
+        const isMacSafari = /Macintosh/.test(ua) && /Safari/.test(ua) && !/Chrome/.test(ua);
+        const hasTouchScreen = navigator.maxTouchPoints > 1;
+        // iPadOS in desktop mode: reports as Mac but has touch screen
+        const isIPadOS = isMacSafari && hasTouchScreen;
+        return isIOS || isIPadOS || isMacSafari;
+    })();
+
+    // Force fetch mode - can be toggled via menu for troubleshooting
+    let forceFetchMode = GM_getValue('qbit_force_fetch', false);
+
+    // Determine if we should use fetch
+    const shouldUseFetch = () => isSafari || forceFetchMode;
 
     // Use native fetch for qBittorrent API (better cookie handling on Safari/iPadOS)
     // Note: Requires CSRF protection disabled in qBittorrent for Safari/iPadOS
@@ -389,9 +403,9 @@
         });
     }
 
-    // Smart request function - uses fetch on Safari/iPadOS, GM_xmlhttpRequest elsewhere
+    // Smart request function - uses fetch on Safari/iPadOS or when forced, GM_xmlhttpRequest elsewhere
     async function qbitRequest(endpoint, method, data, headers = {}, isLogin = false) {
-        if (isSafari) {
+        if (shouldUseFetch()) {
             return qbitRequestFetch(endpoint, method, data, headers);
         } else {
             return qbitRequestGM(endpoint, method, data, headers, isLogin);
@@ -411,9 +425,9 @@
             );
 
             if (response.status === 200 && response.responseText === 'Ok.') {
-                // On Safari, cookies are handled by the browser automatically via fetch
-                // On other browsers, extract SID from response headers
-                if (!isSafari) {
+                // When using fetch, cookies are handled by the browser automatically
+                // When using GM_xmlhttpRequest, extract SID from response headers
+                if (!shouldUseFetch()) {
                     const cookies = response.responseHeaders;
                     console.log('qBittorrent: Login response headers:', cookies);
                     const sidMatch = cookies.match(/SID=([^;]+)/i);
@@ -446,8 +460,8 @@
     }
 
     async function ensureAuthenticated() {
-        // On Safari, try making a request first - browser may already have valid cookies
-        if (isSafari) {
+        // When using fetch, try making a request first - browser may already have valid cookies
+        if (shouldUseFetch()) {
             try {
                 const response = await qbitRequest('/api/v2/app/version', 'GET', null);
                 if (response.status === 200) {
@@ -644,8 +658,8 @@
     async function qbitRequestBinary(endpoint, binaryData, boundary) {
         const url = `${CONFIG.qbittorrent.url}${endpoint}`;
 
-        // Use fetch on Safari for better cookie handling
-        if (isSafari) {
+        // Use fetch on Safari/iPadOS or when forced, for better cookie handling
+        if (shouldUseFetch()) {
             console.log('qBittorrent API (fetch binary): POST', endpoint);
             try {
                 const response = await fetch(url, {
@@ -931,6 +945,13 @@
         window.open(CONFIG.qbittorrent.url, '_blank');
     });
 
+    GM_registerMenuCommand(`🔀 Toggle Fetch Mode (currently: ${forceFetchMode ? 'ON' : 'AUTO'})`, () => {
+        forceFetchMode = !forceFetchMode;
+        GM_setValue('qbit_force_fetch', forceFetchMode);
+        showToast(`Fetch mode: ${forceFetchMode ? 'FORCED ON' : 'AUTO (Safari detection)'}. Reload page to apply.`, 'info');
+        console.log('qBittorrent: Fetch mode set to:', forceFetchMode ? 'FORCED ON' : 'AUTO');
+    });
+
     // ============================================
     // INITIALIZATION
     // ============================================
@@ -950,13 +971,16 @@
         }
 
         console.log('qBittorrent Torrent Interceptor loaded');
-        console.log('Browser detection:', isSafari ? 'Safari/iPadOS (using fetch API)' : 'Other (using GM_xmlhttpRequest)');
+        console.log('Browser detection:', isSafari ? 'Safari/iPadOS' : 'Other browser');
+        console.log('Touch points:', navigator.maxTouchPoints);
+        console.log('Fetch mode:', forceFetchMode ? 'FORCED ON' : 'AUTO');
+        console.log('Using:', shouldUseFetch() ? 'fetch API' : 'GM_xmlhttpRequest');
 
-        if (isSafari) {
-            console.log('%c⚠️ Safari/iPadOS users: If you get CORS errors, you need to configure qBittorrent:', 'color: orange; font-weight: bold');
+        if (shouldUseFetch()) {
+            console.log('%c⚠️ Using fetch API - you need to configure qBittorrent:', 'color: orange; font-weight: bold');
             console.log('  1. Open qBittorrent Web UI → Options → Web UI');
             console.log('  2. Disable "Enable Cross-Site Request Forgery (CSRF) protection"');
-            console.log('  3. Add your domains to "Server domains" (e.g., *) or enable "Enable Host header validation" and add domains');
+            console.log('  3. Add your domain to "Server domains" (e.g., *)');
         }
     }
 
