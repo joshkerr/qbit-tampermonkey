@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.1.0
+// @version      1.2.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -487,52 +487,62 @@
         }
 
         try {
-            // Read file as base64
+            // Read file as ArrayBuffer for proper binary handling
             const reader = new FileReader();
-            const fileData = await new Promise((resolve, reject) => {
+            const arrayBuffer = await new Promise((resolve, reject) => {
                 reader.onload = () => resolve(reader.result);
                 reader.onerror = reject;
-                reader.readAsBinaryString(fileBlob);
+                reader.readAsArrayBuffer(fileBlob);
             });
 
-            // Build multipart form data manually
-            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substr(2);
-            let formBody = '';
+            const fileBytes = new Uint8Array(arrayBuffer);
 
-            // Add torrent file
-            formBody += `--${boundary}\r\n`;
-            formBody += `Content-Disposition: form-data; name="torrents"; filename="${fileName}"\r\n`;
-            formBody += 'Content-Type: application/x-bittorrent\r\n\r\n';
-            formBody += fileData + '\r\n';
+            // Build multipart form data with proper binary handling
+            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substr(2);
+
+            // Helper to convert string to Uint8Array
+            const stringToBytes = (str) => new TextEncoder().encode(str);
+
+            // Build the parts
+            const parts = [];
+
+            // Add torrent file part
+            parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="${fileName}"\r\nContent-Type: application/x-bittorrent\r\n\r\n`));
+            parts.push(fileBytes);
+            parts.push(stringToBytes('\r\n'));
 
             // Add save path if configured
             if (CONFIG.savePath) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="savepath"\r\n\r\n';
-                formBody += CONFIG.savePath + '\r\n';
+                parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="savepath"\r\n\r\n${CONFIG.savePath}\r\n`));
             }
 
             // Add category if configured
             if (CONFIG.category) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="category"\r\n\r\n';
-                formBody += CONFIG.category + '\r\n';
+                parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="category"\r\n\r\n${CONFIG.category}\r\n`));
             }
 
             // Auto-start setting
             if (!CONFIG.autoStart) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="paused"\r\n\r\n';
-                formBody += 'true\r\n';
+                parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="paused"\r\n\r\ntrue\r\n`));
             }
 
-            formBody += `--${boundary}--\r\n`;
+            // End boundary
+            parts.push(stringToBytes(`--${boundary}--\r\n`));
 
-            const response = await qbitRequest(
+            // Concatenate all parts into single Uint8Array
+            const totalLength = parts.reduce((sum, part) => sum + part.length, 0);
+            const formBody = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const part of parts) {
+                formBody.set(part, offset);
+                offset += part.length;
+            }
+
+            // Send using binary-aware request
+            const response = await qbitRequestBinary(
                 '/api/v2/torrents/add',
-                'POST',
                 formBody,
-                { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+                boundary
             );
 
             if (response.status === 200 && response.responseText === 'Ok.') {
@@ -554,6 +564,38 @@
             console.error('Upload torrent error:', error);
             return false;
         }
+    }
+
+    // Binary-aware request function for file uploads
+    function qbitRequestBinary(endpoint, binaryData, boundary) {
+        return new Promise((resolve, reject) => {
+            const url = `${CONFIG.qbittorrent.url}${endpoint}`;
+
+            const requestHeaders = {
+                'Referer': CONFIG.qbittorrent.url + '/',
+                'Origin': CONFIG.qbittorrent.url,
+                'Content-Type': `multipart/form-data; boundary=${boundary}`
+            };
+
+            if (qbitSessionId) {
+                requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
+            }
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: url,
+                headers: requestHeaders,
+                data: binaryData.buffer,
+                binary: true,
+                withCredentials: true,
+                onload: function(response) {
+                    resolve(response);
+                },
+                onerror: function(error) {
+                    reject(error);
+                }
+            });
+        });
     }
 
     // ============================================
