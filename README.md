@@ -11,7 +11,7 @@ A Tampermonkey userscript that intercepts torrent file downloads and magnet link
 - **Toast Notifications** - Visual feedback when torrents are added
 - **Configurable Settings** - Set your qBittorrent URL, credentials, save path, and category
 - **Dark Mode Support** - UI adapts to your system theme
-- **Safari Compatible** - Works with Safari on macOS via Tampermonkey
+- **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey
 
 ## Prerequisites
 
