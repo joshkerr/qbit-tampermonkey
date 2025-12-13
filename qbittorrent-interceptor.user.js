@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.3.0
+// @version      1.4.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -315,26 +315,60 @@
     // QBITTORRENT API
     // ============================================
 
-    function qbitRequest(endpoint, method, data, headers = {}, isLogin = false) {
+    // Detect Safari/iPadOS for using native fetch (better cookie handling)
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) ||
+                     /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+    // Use native fetch for qBittorrent API (better cookie handling on Safari/iPadOS)
+    // Note: Requires CSRF protection disabled in qBittorrent for Safari/iPadOS
+    async function qbitRequestFetch(endpoint, method, data, headers = {}) {
+        const url = `${CONFIG.qbittorrent.url}${endpoint}`;
+
+        const fetchOptions = {
+            method: method,
+            credentials: 'include', // Send cookies
+            headers: { ...headers }
+        };
+
+        if (data) {
+            fetchOptions.body = data;
+        }
+
+        console.log(`qBittorrent API (fetch): ${method} ${endpoint}`);
+
+        try {
+            const response = await fetch(url, fetchOptions);
+            const responseText = await response.text();
+            return {
+                status: response.status,
+                responseText: responseText,
+                responseHeaders: [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
+            };
+        } catch (error) {
+            console.error('Fetch error:', error);
+            throw error;
+        }
+    }
+
+    // Use GM_xmlhttpRequest (works on desktop browsers, can set headers)
+    function qbitRequestGM(endpoint, method, data, headers = {}, isLogin = false) {
         return new Promise((resolve, reject) => {
             const url = `${CONFIG.qbittorrent.url}${endpoint}`;
 
             // Build headers with CSRF protection bypass
-            // qBittorrent checks Referer and Origin headers for CSRF protection
             const requestHeaders = {
                 'Referer': CONFIG.qbittorrent.url + '/',
                 'Origin': CONFIG.qbittorrent.url,
                 ...headers
             };
 
-            // Build request options
             const requestOptions = {
                 method: method,
                 url: url,
                 headers: requestHeaders,
                 data: data,
                 withCredentials: true,
-                anonymous: false, // Ensure cookies are sent
+                anonymous: false,
                 onload: function(response) {
                     resolve(response);
                 },
@@ -343,18 +377,25 @@
                 }
             };
 
-            // Add session cookie if we have one (for authenticated requests)
-            // Use 'cookie' property for better cross-platform support (iPadOS/Safari)
+            // Add session cookie for authenticated requests
             if (qbitSessionId && !isLogin) {
-                // Try both methods for maximum compatibility
                 requestOptions.cookie = `SID=${qbitSessionId}`;
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
             }
 
-            console.log(`qBittorrent API: ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+            console.log(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
 
             GM_xmlhttpRequest(requestOptions);
         });
+    }
+
+    // Smart request function - uses fetch on Safari/iPadOS, GM_xmlhttpRequest elsewhere
+    async function qbitRequest(endpoint, method, data, headers = {}, isLogin = false) {
+        if (isSafari) {
+            return qbitRequestFetch(endpoint, method, data, headers);
+        } else {
+            return qbitRequestGM(endpoint, method, data, headers, isLogin);
+        }
     }
 
     async function qbitLogin() {
@@ -370,17 +411,23 @@
             );
 
             if (response.status === 200 && response.responseText === 'Ok.') {
-                // Extract SID cookie from response headers
-                const cookies = response.responseHeaders;
-                console.log('qBittorrent: Login response headers:', cookies);
-                const sidMatch = cookies.match(/SID=([^;]+)/i);
-                if (sidMatch) {
-                    qbitSessionId = sidMatch[1];
-                    // Store session in GM storage for persistence
-                    GM_setValue('qbit_session', qbitSessionId);
-                    console.log('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
+                // On Safari, cookies are handled by the browser automatically via fetch
+                // On other browsers, extract SID from response headers
+                if (!isSafari) {
+                    const cookies = response.responseHeaders;
+                    console.log('qBittorrent: Login response headers:', cookies);
+                    const sidMatch = cookies.match(/SID=([^;]+)/i);
+                    if (sidMatch) {
+                        qbitSessionId = sidMatch[1];
+                        GM_setValue('qbit_session', qbitSessionId);
+                        console.log('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
+                    } else {
+                        console.warn('qBittorrent: Login succeeded but no SID cookie found in response');
+                    }
                 } else {
-                    console.warn('qBittorrent: Login succeeded but no SID cookie found in response');
+                    // On Safari, mark as authenticated (browser handles cookie)
+                    qbitSessionId = 'safari-auto';
+                    console.log('qBittorrent: Login successful (Safari - browser handles cookies)');
                 }
                 return true;
             } else if (response.status === 403) {
@@ -399,7 +446,22 @@
     }
 
     async function ensureAuthenticated() {
-        // Try to restore session from storage
+        // On Safari, try making a request first - browser may already have valid cookies
+        if (isSafari) {
+            try {
+                const response = await qbitRequest('/api/v2/app/version', 'GET', null);
+                if (response.status === 200) {
+                    console.log('qBittorrent: Already authenticated (Safari cookies valid)');
+                    qbitSessionId = 'safari-auto';
+                    return true;
+                }
+            } catch (e) {
+                console.log('qBittorrent: Safari auth check failed, will login');
+            }
+            return await qbitLogin();
+        }
+
+        // For non-Safari: try to restore session from storage
         if (!qbitSessionId) {
             qbitSessionId = GM_getValue('qbit_session', null);
         }
@@ -579,10 +641,34 @@
     }
 
     // Binary-aware request function for file uploads
-    function qbitRequestBinary(endpoint, binaryData, boundary) {
-        return new Promise((resolve, reject) => {
-            const url = `${CONFIG.qbittorrent.url}${endpoint}`;
+    async function qbitRequestBinary(endpoint, binaryData, boundary) {
+        const url = `${CONFIG.qbittorrent.url}${endpoint}`;
 
+        // Use fetch on Safari for better cookie handling
+        if (isSafari) {
+            console.log('qBittorrent API (fetch binary): POST', endpoint);
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': `multipart/form-data; boundary=${boundary}`
+                    },
+                    body: binaryData.buffer
+                });
+                const responseText = await response.text();
+                return {
+                    status: response.status,
+                    responseText: responseText
+                };
+            } catch (error) {
+                console.error('Fetch binary error:', error);
+                throw error;
+            }
+        }
+
+        // Use GM_xmlhttpRequest for non-Safari
+        return new Promise((resolve, reject) => {
             const requestHeaders = {
                 'Referer': CONFIG.qbittorrent.url + '/',
                 'Origin': CONFIG.qbittorrent.url,
@@ -605,13 +691,13 @@
                 }
             };
 
-            // Add session cookie using both methods for compatibility
-            if (qbitSessionId) {
+            // Add session cookie
+            if (qbitSessionId && qbitSessionId !== 'safari-auto') {
                 requestOptions.cookie = `SID=${qbitSessionId}`;
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
             }
 
-            console.log('qBittorrent API: POST (binary)', endpoint, `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+            console.log('qBittorrent API (GM binary): POST', endpoint);
 
             GM_xmlhttpRequest(requestOptions);
         });
@@ -864,6 +950,14 @@
         }
 
         console.log('qBittorrent Torrent Interceptor loaded');
+        console.log('Browser detection:', isSafari ? 'Safari/iPadOS (using fetch API)' : 'Other (using GM_xmlhttpRequest)');
+
+        if (isSafari) {
+            console.log('%c⚠️ Safari/iPadOS users: If you get CORS errors, you need to configure qBittorrent:', 'color: orange; font-weight: bold');
+            console.log('  1. Open qBittorrent Web UI → Options → Web UI');
+            console.log('  2. Disable "Enable Cross-Site Request Forgery (CSRF) protection"');
+            console.log('  3. Add your domains to "Server domains" (e.g., *) or enable "Enable Host header validation" and add domains');
+        }
     }
 
     init();
