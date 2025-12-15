@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.7.1
+// @version      1.7.2
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -475,12 +475,21 @@
             };
 
             // Add session cookie for authenticated requests
-            if (qbitSessionId && !isLogin) {
+            // Only set if we have a real SID (not placeholder values)
+            const hasRealSid = qbitSessionId &&
+                              qbitSessionId !== 'no-sid-cookie' &&
+                              qbitSessionId !== 'safari-auto';
+
+            if (hasRealSid && !isLogin) {
                 requestOptions.cookie = `SID=${qbitSessionId}`;
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
+                console.log(`  → Cookie: SID=${qbitSessionId.substring(0, 8)}...`);
+            } else if (!isLogin) {
+                // No manual cookie - rely on withCredentials to send browser cookies
+                console.log(`  → Cookie: (relying on browser cookies via withCredentials)`);
             }
 
-            console.log(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+            console.log(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${hasRealSid ? 'manual' : 'browser'})`);
             console.log(`  → URL: ${url}`);
             console.log(`  → Origin: ${origin}`);
             console.log(`  → Referer: ${requestHeaders['Referer']}`);
@@ -812,13 +821,17 @@
                 }
             };
 
-            // Add session cookie
-            if (qbitSessionId && qbitSessionId !== 'safari-auto') {
+            // Add session cookie only if we have a real SID
+            const hasRealSid = qbitSessionId &&
+                              qbitSessionId !== 'no-sid-cookie' &&
+                              qbitSessionId !== 'safari-auto';
+
+            if (hasRealSid) {
                 requestOptions.cookie = `SID=${qbitSessionId}`;
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
             }
 
-            console.log('qBittorrent API (GM binary): POST', endpoint);
+            console.log('qBittorrent API (GM binary): POST', endpoint, hasRealSid ? '(manual SID)' : '(browser cookies)');
 
             GM_xmlhttpRequest(requestOptions);
         });
