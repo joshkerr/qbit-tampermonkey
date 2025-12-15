@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.7.0
+// @version      1.7.1
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -433,15 +433,29 @@
         }
     }
 
+    // Extract origin (scheme + host) from URL for CSRF headers
+    function getOriginFromUrl(urlString) {
+        try {
+            const url = new URL(urlString);
+            return url.origin; // Returns "https://example.com" without path
+        } catch (e) {
+            // Fallback: extract origin manually
+            const match = urlString.match(/^(https?:\/\/[^\/]+)/);
+            return match ? match[1] : urlString;
+        }
+    }
+
     // Use GM_xmlhttpRequest (works on desktop browsers, can set headers)
     function qbitRequestGM(endpoint, method, data, headers = {}, isLogin = false) {
         return new Promise((resolve, reject) => {
             const url = `${CONFIG.qbittorrent.url}${endpoint}`;
+            const origin = getOriginFromUrl(CONFIG.qbittorrent.url);
 
             // Build headers with CSRF protection bypass
+            // Origin must be just scheme+host (no path), Referer can include path
             const requestHeaders = {
                 'Referer': CONFIG.qbittorrent.url + '/',
-                'Origin': CONFIG.qbittorrent.url,
+                'Origin': origin,
                 ...headers
             };
 
@@ -467,6 +481,9 @@
             }
 
             console.log(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${qbitSessionId ? 'yes' : 'no'})`);
+            console.log(`  → URL: ${url}`);
+            console.log(`  → Origin: ${origin}`);
+            console.log(`  → Referer: ${requestHeaders['Referer']}`);
 
             GM_xmlhttpRequest(requestOptions);
         });
@@ -772,9 +789,10 @@
 
         // Use GM_xmlhttpRequest for non-Safari
         return new Promise((resolve, reject) => {
+            const origin = getOriginFromUrl(CONFIG.qbittorrent.url);
             const requestHeaders = {
                 'Referer': CONFIG.qbittorrent.url + '/',
-                'Origin': CONFIG.qbittorrent.url,
+                'Origin': origin,
                 'Content-Type': `multipart/form-data; boundary=${boundary}`
             };
 
