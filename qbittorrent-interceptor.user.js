@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.7.3
+// @version      1.7.4
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -653,9 +653,11 @@
             }
 
             // Automatic Torrent Management - lets qBittorrent manage save paths
+            // If user has configured a custom savePath, disable autoTMM so their path is used
+            const useAutoTMM = CONFIG.autoTMM && !CONFIG.savePath;
             formBody += `--${boundary}\r\n`;
             formBody += 'Content-Disposition: form-data; name="autoTMM"\r\n\r\n';
-            formBody += (CONFIG.autoTMM ? 'true' : 'false') + '\r\n';
+            formBody += (useAutoTMM ? 'true' : 'false') + '\r\n';
 
             formBody += `--${boundary}--\r\n`;
 
@@ -737,7 +739,9 @@
             }
 
             // Automatic Torrent Management - lets qBittorrent manage save paths
-            parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="autoTMM"\r\n\r\n${CONFIG.autoTMM ? 'true' : 'false'}\r\n`));
+            // If user has configured a custom savePath, disable autoTMM so their path is used
+            const useAutoTMM = CONFIG.autoTMM && !CONFIG.savePath;
+            parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="autoTMM"\r\n\r\n${useAutoTMM ? 'true' : 'false'}\r\n`));
 
             // End boundary
             parts.push(stringToBytes(`--${boundary}--\r\n`));
