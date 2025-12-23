@@ -70,6 +70,7 @@
             max-width: 500px;
             width: 90%;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            color: #000;
         }
         .qbit-modal-dark {
             background: #1e1e1e;
@@ -931,6 +932,7 @@
                lowerUrl.includes('action=download') ||
                // Common torrent site patterns
                /\/torrent\/\d+\/download/.test(lowerUrl) ||
+               /\/torrents\/download\/\d+/.test(lowerUrl) ||
                /download\.php\?.*torrent/i.test(lowerUrl);
     }
 
