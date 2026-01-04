@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.7.4
+// @version      1.7.5
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -623,50 +623,35 @@
         }
 
         try {
-            // Build form data
-            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substr(2);
-            let formBody = '';
-
-            // Add URL
-            formBody += `--${boundary}\r\n`;
-            formBody += 'Content-Disposition: form-data; name="urls"\r\n\r\n';
-            formBody += url + '\r\n';
+            // Build form data using URLSearchParams for proper encoding
+            const formData = new URLSearchParams();
+            formData.append('urls', url);
 
             // Add save path if configured
             if (CONFIG.savePath) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="savepath"\r\n\r\n';
-                formBody += CONFIG.savePath + '\r\n';
+                formData.append('savepath', CONFIG.savePath);
             }
 
             // Add category if configured
             if (CONFIG.category) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="category"\r\n\r\n';
-                formBody += CONFIG.category + '\r\n';
+                formData.append('category', CONFIG.category);
             }
 
             // Auto-start setting
             if (!CONFIG.autoStart) {
-                formBody += `--${boundary}\r\n`;
-                formBody += 'Content-Disposition: form-data; name="paused"\r\n\r\n';
-                formBody += 'true\r\n';
+                formData.append('paused', 'true');
             }
 
             // Automatic Torrent Management - lets qBittorrent manage save paths
             // If user has configured a custom savePath, disable autoTMM so their path is used
             const useAutoTMM = CONFIG.autoTMM && !CONFIG.savePath;
-            formBody += `--${boundary}\r\n`;
-            formBody += 'Content-Disposition: form-data; name="autoTMM"\r\n\r\n';
-            formBody += (useAutoTMM ? 'true' : 'false') + '\r\n';
-
-            formBody += `--${boundary}--\r\n`;
+            formData.append('autoTMM', useAutoTMM ? 'true' : 'false');
 
             const response = await qbitRequest(
                 '/api/v2/torrents/add',
                 'POST',
-                formBody,
-                { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+                formData.toString(),
+                { 'Content-Type': 'application/x-www-form-urlencoded' }
             );
 
             if (response.status === 200 && response.responseText === 'Ok.') {
@@ -675,6 +660,7 @@
                 return true;
             } else if (response.status === 415) {
                 showToast('qBittorrent: Torrent file is not valid', 'error');
+                console.log('qBittorrent 415 error - invalid torrent. URL:', url);
                 return false;
             } else if (response.status === 403 && retryCount < 1) {
                 // Session might have expired or CSRF issue - force re-login and retry
