@@ -75,9 +75,13 @@ Once installed and configured, the script automatically:
 1. **Magnet Links** - When you click any `magnet:` link, a dialog appears asking to send it to qBittorrent
 2. **Torrent Files** - When you click a link to a `.torrent` file, it's downloaded using your current session cookies and sent to qBittorrent
 
+![Add Torrent Dialog](screenshots/popup.png)
+
 ### Menu Commands
 
 Click the Tampermonkey icon to access:
+
+![Tampermonkey Menu](screenshots/dropdown.png)
 
 - **Configure qBittorrent** - Open settings dialog
 - **Add Torrent by URL** - Manually enter a magnet or torrent URL
