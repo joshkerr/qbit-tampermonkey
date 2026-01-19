@@ -1,6 +1,6 @@
 # qBittorrent Tampermonkey Interceptor
 
-A Tampermonkey userscript that intercepts torrent file downloads and magnet links, automatically sending them to your qBittorrent server.
+A Tampermonkey userscript that intercepts torrent file downloads and magnet links, automatically sending them to your qBittorrent server. This one works with Chrome, Firefox and Safari. The Safari support means that iOS and iPad OS users now have an option for loading torrents directly into their qbittorrent servers from websites. 
 
 ## Features
 
