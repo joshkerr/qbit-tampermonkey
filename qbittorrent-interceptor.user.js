@@ -375,7 +375,7 @@
 
         // Quick action: Open Web UI (keep modal open so user can continue configuring)
         document.getElementById('qbit-act-webui').onclick = () => {
-            window.open(CONFIG.qbittorrent.url, '_blank');
+            window.open(CONFIG.qbittorrent.url, '_blank', 'noopener,noreferrer');
         };
 
         // Quick action: Establish Session (Safari/iPadOS) — closes modal to show session helper
@@ -391,7 +391,7 @@
 
         // Quick action: Toggle Fetch Mode
         const fetchCheckbox = document.getElementById('qbit-act-fetch');
-        const fetchLabel = document.querySelector('label[for="qbit-act-fetch"]');
+        const fetchLabel = modal.querySelector('label[for="qbit-act-fetch"]');
         fetchCheckbox.onchange = () => {
             forceFetchMode = fetchCheckbox.checked;
             GM_setValue('qbit_force_fetch', forceFetchMode);
