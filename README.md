@@ -83,10 +83,9 @@ Click the Tampermonkey icon to access:
 
 ![Tampermonkey Menu](screenshots/dropdown.png)
 
-- **Configure qBittorrent** - Open settings dialog
+- **Configure qBittorrent** - Open settings dialog (includes Quick Actions for Force Re-login, Open Web UI, Establish Session, and Fetch Mode toggle)
 - **Add Torrent by URL** - Manually enter a magnet or torrent URL
 - **Test Connection** - Verify qBittorrent connectivity
-- **Show qBittorrent Web UI** - Open qBittorrent in a new tab
 
 ### Authenticated Sites
 
