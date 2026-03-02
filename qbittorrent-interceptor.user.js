@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.7.5
+// @version      1.8.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent
 // @author       joshkerr
 // @match        *://*/*
@@ -178,6 +178,70 @@
             margin: 10px 0;
             font-size: 13px;
         }
+        .qbit-actions-divider {
+            border: none;
+            border-top: 1px solid #ddd;
+            margin: 16px 0 12px;
+        }
+        .qbit-modal-dark .qbit-actions-divider {
+            border-top-color: #444;
+        }
+        .qbit-actions-header {
+            font-size: 13px;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 10px;
+        }
+        .qbit-actions-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .qbit-action-btn {
+            padding: 8px 14px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            background: #f5f5f5;
+            color: #333;
+            font-weight: 500;
+        }
+        .qbit-action-btn:hover {
+            background: #e8e8e8;
+        }
+        .qbit-modal-dark .qbit-action-btn {
+            background: #2d2d2d;
+            border-color: #555;
+            color: #ddd;
+        }
+        .qbit-modal-dark .qbit-action-btn:hover {
+            background: #3a3a3a;
+        }
+        .qbit-toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        .qbit-toggle-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+        .qbit-toggle-label {
+            cursor: pointer;
+            user-select: none;
+        }
+        .qbit-toggle-hint {
+            font-size: 11px;
+            color: #999;
+            margin-top: 2px;
+        }
     `);
 
     // ============================================
@@ -269,6 +333,18 @@
                     Category (optional):
                     <input type="text" id="qbit-cfg-category" value="${CONFIG.category}">
                 </label>
+                <hr class="qbit-actions-divider">
+                <div class="qbit-actions-header">Quick Actions</div>
+                <div class="qbit-actions-grid">
+                    <button class="qbit-action-btn" id="qbit-act-relogin">🔄 Force Re-login</button>
+                    <button class="qbit-action-btn" id="qbit-act-webui">📊 Open Web UI</button>
+                    <button class="qbit-action-btn" id="qbit-act-session">🔑 Establish Session</button>
+                </div>
+                <div class="qbit-toggle-row">
+                    <input type="checkbox" id="qbit-act-fetch" ${forceFetchMode ? 'checked' : ''}>
+                    <label class="qbit-toggle-label" for="qbit-act-fetch">Fetch Mode (currently ${forceFetchMode ? 'ON' : 'OFF'})</label>
+                </div>
+                <div class="qbit-toggle-hint">Uses browser fetch API instead of GM_xmlhttpRequest. Requires CORS. Reload page after changing.</div>
             </div>
             <div class="qbit-modal-buttons">
                 <button class="qbit-btn-secondary" id="qbit-cfg-cancel">Cancel</button>
@@ -278,6 +354,41 @@
 
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
+
+        // Quick action: Force Re-login
+        document.getElementById('qbit-act-relogin').onclick = async () => {
+            qbitSessionId = null;
+            GM_setValue('qbit_session', null);
+            overlay.remove();
+            showToast('Session cleared, logging in...', 'info');
+            const success = await qbitLogin();
+            if (success) {
+                showToast('Re-login successful!', 'success');
+            }
+        };
+
+        // Quick action: Open Web UI
+        document.getElementById('qbit-act-webui').onclick = () => {
+            window.open(CONFIG.qbittorrent.url, '_blank');
+        };
+
+        // Quick action: Establish Session (Safari/iPadOS)
+        document.getElementById('qbit-act-session').onclick = async () => {
+            overlay.remove();
+            const established = await establishSafariSession();
+            if (established) {
+                await ensureAuthenticated();
+            }
+        };
+
+        // Quick action: Toggle Fetch Mode
+        const fetchCheckbox = document.getElementById('qbit-act-fetch');
+        fetchCheckbox.onchange = () => {
+            forceFetchMode = fetchCheckbox.checked;
+            GM_setValue('qbit_force_fetch', forceFetchMode);
+            fetchCheckbox.nextElementSibling.textContent = `Fetch Mode (currently ${forceFetchMode ? 'ON' : 'OFF'})`;
+            showToast(`Fetch mode: ${forceFetchMode ? 'ON (uses CORS)' : 'OFF (uses GM_xmlhttpRequest)'}. Reload page to apply.`, 'info');
+        };
 
         document.getElementById('qbit-cfg-save').onclick = () => {
             const url = document.getElementById('qbit-cfg-url').value.replace(/\/$/, '');
@@ -1049,37 +1160,6 @@
                 showToast('Connected but could not get version', 'info');
                 console.error('qBittorrent test error:', e);
             }
-        }
-    });
-
-    GM_registerMenuCommand('🔄 Force Re-login', async () => {
-        // Clear stored session
-        qbitSessionId = null;
-        GM_setValue('qbit_session', null);
-        showToast('Session cleared, logging in...', 'info');
-        const success = await qbitLogin();
-        if (success) {
-            showToast('Re-login successful!', 'success');
-        }
-    });
-
-    GM_registerMenuCommand('📊 Show qBittorrent Web UI', () => {
-        window.open(CONFIG.qbittorrent.url, '_blank');
-    });
-
-    GM_registerMenuCommand(`🔀 Toggle Fetch Mode (currently: ${forceFetchMode ? 'ON' : 'OFF'})`, () => {
-        forceFetchMode = !forceFetchMode;
-        GM_setValue('qbit_force_fetch', forceFetchMode);
-        showToast(`Fetch mode: ${forceFetchMode ? 'ON (uses CORS)' : 'OFF (uses GM_xmlhttpRequest)'}. Reload page to apply.`, 'info');
-        console.log('qBittorrent: Fetch mode set to:', forceFetchMode ? 'ON' : 'OFF');
-    });
-
-    // Always show establish session option - useful for Safari/iPadOS cookie issues
-    GM_registerMenuCommand('🔑 Establish Session (Safari/iPadOS)', async () => {
-        const established = await establishSafariSession();
-        if (established) {
-            // Try to authenticate after session established
-            await ensureAuthenticated();
         }
     });
 
