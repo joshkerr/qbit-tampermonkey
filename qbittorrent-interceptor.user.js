@@ -242,6 +242,12 @@
             color: #999;
             margin-top: 2px;
         }
+        .qbit-modal-dark .qbit-actions-header {
+            color: #aaa;
+        }
+        .qbit-modal-dark .qbit-toggle-hint {
+            color: #777;
+        }
     `);
 
     // ============================================
@@ -367,26 +373,29 @@
             }
         };
 
-        // Quick action: Open Web UI
+        // Quick action: Open Web UI (keep modal open so user can continue configuring)
         document.getElementById('qbit-act-webui').onclick = () => {
             window.open(CONFIG.qbittorrent.url, '_blank');
         };
 
-        // Quick action: Establish Session (Safari/iPadOS)
+        // Quick action: Establish Session (Safari/iPadOS) — closes modal to show session helper
         document.getElementById('qbit-act-session').onclick = async () => {
             overlay.remove();
             const established = await establishSafariSession();
             if (established) {
                 await ensureAuthenticated();
+            } else {
+                showToast('Could not establish session', 'error');
             }
         };
 
         // Quick action: Toggle Fetch Mode
         const fetchCheckbox = document.getElementById('qbit-act-fetch');
+        const fetchLabel = document.querySelector('label[for="qbit-act-fetch"]');
         fetchCheckbox.onchange = () => {
             forceFetchMode = fetchCheckbox.checked;
             GM_setValue('qbit_force_fetch', forceFetchMode);
-            fetchCheckbox.nextElementSibling.textContent = `Fetch Mode (currently ${forceFetchMode ? 'ON' : 'OFF'})`;
+            fetchLabel.textContent = `Fetch Mode (currently ${forceFetchMode ? 'ON' : 'OFF'})`;
             showToast(`Fetch mode: ${forceFetchMode ? 'ON (uses CORS)' : 'OFF (uses GM_xmlhttpRequest)'}. Reload page to apply.`, 'info');
         };
 
