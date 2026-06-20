@@ -6,6 +6,7 @@ A Tampermonkey userscript that intercepts torrent file downloads and magnet link
 
 - **Magnet Link Interception** - Clicks on magnet links are captured and sent to qBittorrent
 - **Torrent File Interception** - Downloads of `.torrent` files are intercepted and uploaded to qBittorrent
+- **Download Locally** - Optionally save the `.torrent` file to your own computer instead of sending it to qBittorrent (magnet links can be opened in your default torrent app)
 - **Authenticated Site Support** - Uses your browser's cookies to download torrents from sites requiring login
 - **Confirmation Dialogs** - Optional confirmation before adding torrents
 - **Toast Notifications** - Visual feedback when torrents are added
@@ -72,8 +73,13 @@ If you access qBittorrent over HTTPS:
 
 Once installed and configured, the script automatically:
 
-1. **Magnet Links** - When you click any `magnet:` link, a dialog appears asking to send it to qBittorrent
+1. **Magnet Links** - When you click any `magnet:` link, a dialog appears asking to send it to qBittorrent (or open it in your default torrent app)
 2. **Torrent Files** - When you click a link to a `.torrent` file, it's downloaded using your current session cookies and sent to qBittorrent
+
+The confirmation dialog offers a choice:
+- **Add to qBittorrent** - Send the torrent/magnet to your qBittorrent server (the primary action)
+- **⬇️ Download File** - Save the `.torrent` file directly to your computer (for torrent file links)
+- **🧲 Open in App** - Hand the magnet link off to your system's default torrent client (for magnet links)
 
 ![Add Torrent Dialog](screenshots/popup.png)
 
