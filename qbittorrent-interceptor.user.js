@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.8.0
-// @description  Intercept torrent downloads and magnet links, send them to qBittorrent
+// @version      1.9.0
+// @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
 // @author       joshkerr
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -272,19 +272,29 @@
         return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
 
-    function showModal(title, content, onConfirm, onCancel) {
+    // options.confirmLabel: text for the primary button (default "Add to qBittorrent")
+    // options.extraButtons: array of { label, className, onClick } shown between Cancel and Confirm.
+    //   Each extra button closes the modal before invoking onClick.
+    function showModal(title, content, onConfirm, onCancel, options = {}) {
         const overlay = document.createElement('div');
         overlay.className = 'qbit-modal-overlay';
 
         const modal = document.createElement('div');
         modal.className = `qbit-modal ${isDarkMode() ? 'qbit-modal-dark' : ''}`;
 
+        const confirmLabel = options.confirmLabel || 'Add to qBittorrent';
+        const extraButtons = options.extraButtons || [];
+        const extraButtonsHtml = extraButtons.map((btn, i) =>
+            `<button class="${btn.className || 'qbit-btn-secondary'}" id="qbit-extra-${i}">${btn.label}</button>`
+        ).join('');
+
         modal.innerHTML = `
             <h2>${title}</h2>
             <div class="qbit-modal-content">${content}</div>
             <div class="qbit-modal-buttons">
                 <button class="qbit-btn-secondary" id="qbit-cancel">Cancel</button>
-                <button class="qbit-btn-primary" id="qbit-confirm">Add to qBittorrent</button>
+                ${extraButtonsHtml}
+                <button class="qbit-btn-primary" id="qbit-confirm">${confirmLabel}</button>
             </div>
         `;
 
@@ -300,6 +310,13 @@
             overlay.remove();
             if (onCancel) onCancel();
         };
+
+        extraButtons.forEach((btn, i) => {
+            document.getElementById(`qbit-extra-${i}`).onclick = () => {
+                overlay.remove();
+                if (btn.onClick) btn.onClick();
+            };
+        });
 
         overlay.onclick = (e) => {
             if (e.target === overlay) {
@@ -999,6 +1016,36 @@
         }
     }
 
+    // Save a blob to the user's computer via a temporary download link
+    function saveBlobToComputer(blob, fileName) {
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = fileName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Revoke after a tick so the download has a chance to start
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    }
+
+    // Download the .torrent file and save it to the local computer instead of
+    // sending it to qBittorrent. Uses the current site session cookies, so it
+    // works on authenticated trackers just like the qBittorrent path.
+    async function handleLocalDownload(url, fileName) {
+        showToast('Downloading torrent file...', 'info');
+
+        try {
+            const blob = await downloadTorrentFile(url);
+            saveBlobToComputer(blob, fileName);
+            showToast(`Saved: ${fileName}`, 'success');
+        } catch (error) {
+            console.error('Local download failed:', error);
+            showToast('Could not download torrent file', 'error');
+        }
+    }
+
     // ============================================
     // LINK INTERCEPTION
     // ============================================
@@ -1058,13 +1105,27 @@
                 <div class="qbit-torrent-name">${torrentName}</div>
             `;
 
+            const magnet = isMagnetUrl(url);
+
+            // Secondary action: for .torrent links, download the file locally.
+            // Magnet links aren't files, so offer to hand off to the default app instead.
+            const extraButtons = magnet
+                ? [{
+                    label: '🧲 Open in App',
+                    onClick: () => { window.location.href = url; }
+                  }]
+                : [{
+                    label: '⬇️ Download File',
+                    onClick: () => handleLocalDownload(url, torrentName + '.torrent')
+                  }];
+
             showModal('🧲 Add Torrent', content, async () => {
-                if (isMagnetUrl(url)) {
+                if (magnet) {
                     await addTorrentByUrl(url, torrentName);
                 } else {
                     await handleTorrentDownload(url, torrentName + '.torrent');
                 }
-            });
+            }, null, { extraButtons });
         } else {
             event.preventDefault();
             event.stopPropagation();
@@ -1110,6 +1171,11 @@
                     `;
                     showModal('🧲 Add Torrent', content, async () => {
                         await addTorrentByUrl(url, torrentName);
+                    }, null, {
+                        extraButtons: [{
+                            label: '🧲 Open in App',
+                            onClick: () => { window.location.href = url; }
+                        }]
                     });
                 } else {
                     addTorrentByUrl(url, torrentName);
