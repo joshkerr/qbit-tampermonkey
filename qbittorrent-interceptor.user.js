@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.9.0
+// @version      1.10.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
 // @author       joshkerr
 // @match        *://*/*
@@ -22,26 +22,37 @@
     // ============================================
     // CONFIGURATION - Edit these values
     // ============================================
+    // Getters read live from GM storage so settings changed in another tab
+    // (or in this tab's settings modal) apply without a page reload.
     const CONFIG = {
         // qBittorrent Web UI settings
         qbittorrent: {
-            url: GM_getValue('qbit_url', 'http://localhost:8080'),
-            username: GM_getValue('qbit_username', 'admin'),
-            password: GM_getValue('qbit_password', 'adminadmin'),
+            get url() { return GM_getValue('qbit_url', 'http://localhost:8080'); },
+            get username() { return GM_getValue('qbit_username', 'admin'); },
+            get password() { return GM_getValue('qbit_password', 'adminadmin'); },
         },
         // Default save path (leave empty for qBittorrent default)
-        savePath: GM_getValue('qbit_savepath', ''),
+        get savePath() { return GM_getValue('qbit_savepath', ''); },
         // Category for added torrents (leave empty for none)
-        category: GM_getValue('qbit_category', ''),
+        get category() { return GM_getValue('qbit_category', ''); },
         // Automatically start torrent after adding
-        autoStart: GM_getValue('qbit_autostart', true),
+        get autoStart() { return GM_getValue('qbit_autostart', true); },
         // Use Automatic Torrent Management (lets qBittorrent manage save paths by category)
-        autoTMM: GM_getValue('qbit_autotmm', true),
+        get autoTMM() { return GM_getValue('qbit_autotmm', true); },
         // Show notifications
-        showNotifications: GM_getValue('qbit_notifications', true),
+        get showNotifications() { return GM_getValue('qbit_notifications', true); },
         // Show confirmation dialog before adding
-        showConfirmation: GM_getValue('qbit_confirmation', true),
+        get showConfirmation() { return GM_getValue('qbit_confirmation', true); },
     };
+
+    // Timeout for all network requests (GM_xmlhttpRequest and fetch)
+    const REQUEST_TIMEOUT_MS = 15000;
+
+    // Verbose console logging (toggle in the settings modal)
+    let debugMode = GM_getValue('qbit_debug', false);
+    function debugLog(...args) {
+        if (debugMode) console.log(...args);
+    }
 
     // Session ID for qBittorrent authentication
     let qbitSessionId = null;
@@ -254,12 +265,43 @@
     // UTILITY FUNCTIONS
     // ============================================
 
+    // Escape untrusted text (torrent names, stored settings) before inserting
+    // into innerHTML or HTML attributes
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // decodeURIComponent throws URIError on malformed percent-encoding
+    function safeDecodeURIComponent(str) {
+        try {
+            return decodeURIComponent(str);
+        } catch (e) {
+            return str;
+        }
+    }
+
     function showToast(message, type = 'info') {
         if (!CONFIG.showNotifications) return;
+
+        // Before <body> exists (document-start), fall back to a GM notification
+        if (!document.body) {
+            if (typeof GM_notification === 'function') {
+                GM_notification({ text: message, title: 'qBittorrent', timeout: 4000 });
+            }
+            return;
+        }
 
         const toast = document.createElement('div');
         toast.className = `qbit-toast qbit-toast-${type}`;
         toast.textContent = message;
+        // Stack above any toasts already showing instead of overlapping them
+        const existing = document.querySelectorAll('.qbit-toast').length;
+        toast.style.bottom = `${20 + existing * 60}px`;
         document.body.appendChild(toast);
 
         setTimeout(() => {
@@ -284,45 +326,61 @@
 
         const confirmLabel = options.confirmLabel || 'Add to qBittorrent';
         const extraButtons = options.extraButtons || [];
-        const extraButtonsHtml = extraButtons.map((btn, i) =>
-            `<button class="${btn.className || 'qbit-btn-secondary'}" id="qbit-extra-${i}">${btn.label}</button>`
-        ).join('');
 
+        // Buttons are looked up via modal.querySelector (not global IDs) so
+        // two modals can coexist without their handlers cross-wiring
         modal.innerHTML = `
-            <h2>${title}</h2>
+            <h2>${escapeHtml(title)}</h2>
             <div class="qbit-modal-content">${content}</div>
             <div class="qbit-modal-buttons">
-                <button class="qbit-btn-secondary" id="qbit-cancel">Cancel</button>
-                ${extraButtonsHtml}
-                <button class="qbit-btn-primary" id="qbit-confirm">${confirmLabel}</button>
+                <button class="qbit-btn-secondary qbit-cancel">Cancel</button>
+                <button class="qbit-btn-primary qbit-confirm"></button>
             </div>
         `;
+
+        const buttonRow = modal.querySelector('.qbit-modal-buttons');
+        const confirmBtn = modal.querySelector('.qbit-confirm');
+        confirmBtn.textContent = confirmLabel;
 
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
 
-        document.getElementById('qbit-confirm').onclick = () => {
+        const close = () => {
+            document.removeEventListener('keydown', onKeydown, true);
             overlay.remove();
+        };
+        const cancel = () => {
+            close();
+            if (onCancel) onCancel();
+        };
+        const onKeydown = (e) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                cancel();
+            }
+        };
+        document.addEventListener('keydown', onKeydown, true);
+
+        confirmBtn.onclick = () => {
+            close();
             if (onConfirm) onConfirm();
         };
 
-        document.getElementById('qbit-cancel').onclick = () => {
-            overlay.remove();
-            if (onCancel) onCancel();
-        };
+        modal.querySelector('.qbit-cancel').onclick = cancel;
 
-        extraButtons.forEach((btn, i) => {
-            document.getElementById(`qbit-extra-${i}`).onclick = () => {
-                overlay.remove();
+        extraButtons.forEach((btn) => {
+            const el = document.createElement('button');
+            el.className = btn.className || 'qbit-btn-secondary';
+            el.textContent = btn.label;
+            el.onclick = () => {
+                close();
                 if (btn.onClick) btn.onClick();
             };
+            buttonRow.insertBefore(el, confirmBtn);
         });
 
         overlay.onclick = (e) => {
-            if (e.target === overlay) {
-                overlay.remove();
-                if (onCancel) onCancel();
-            }
+            if (e.target === overlay) cancel();
         };
     }
 
@@ -338,23 +396,23 @@
             <div class="qbit-modal-content">
                 <label>
                     qBittorrent URL:
-                    <input type="text" id="qbit-cfg-url" value="${CONFIG.qbittorrent.url}" placeholder="http://localhost:8080">
+                    <input type="text" id="qbit-cfg-url" value="${escapeHtml(CONFIG.qbittorrent.url)}" placeholder="http://localhost:8080">
                 </label>
                 <label>
                     Username:
-                    <input type="text" id="qbit-cfg-username" value="${CONFIG.qbittorrent.username}">
+                    <input type="text" id="qbit-cfg-username" value="${escapeHtml(CONFIG.qbittorrent.username)}">
                 </label>
                 <label>
                     Password:
-                    <input type="password" id="qbit-cfg-password" value="${CONFIG.qbittorrent.password}">
+                    <input type="password" id="qbit-cfg-password" value="${escapeHtml(CONFIG.qbittorrent.password)}">
                 </label>
                 <label>
                     Default Save Path (optional):
-                    <input type="text" id="qbit-cfg-savepath" value="${CONFIG.savePath}" placeholder="/downloads/torrents">
+                    <input type="text" id="qbit-cfg-savepath" value="${escapeHtml(CONFIG.savePath)}" placeholder="/downloads/torrents">
                 </label>
                 <label>
                     Category (optional):
-                    <input type="text" id="qbit-cfg-category" value="${CONFIG.category}">
+                    <input type="text" id="qbit-cfg-category" value="${escapeHtml(CONFIG.category)}">
                 </label>
                 <hr class="qbit-actions-divider">
                 <div class="qbit-actions-header">Quick Actions</div>
@@ -368,6 +426,11 @@
                     <label class="qbit-toggle-label" for="qbit-act-fetch">Fetch Mode (currently ${forceFetchMode ? 'ON' : 'OFF'})</label>
                 </div>
                 <div class="qbit-toggle-hint">Uses browser fetch API instead of GM_xmlhttpRequest. Requires CORS. Reload page after changing.</div>
+                <div class="qbit-toggle-row">
+                    <input type="checkbox" id="qbit-act-debug" ${debugMode ? 'checked' : ''}>
+                    <label class="qbit-toggle-label" for="qbit-act-debug">Debug Logging (currently ${debugMode ? 'ON' : 'OFF'})</label>
+                </div>
+                <div class="qbit-toggle-hint">Logs API activity to the browser console.</div>
             </div>
             <div class="qbit-modal-buttons">
                 <button class="qbit-btn-secondary" id="qbit-cfg-cancel">Cancel</button>
@@ -379,10 +442,10 @@
         document.body.appendChild(overlay);
 
         // Quick action: Force Re-login
-        document.getElementById('qbit-act-relogin').onclick = async () => {
+        modal.querySelector('#qbit-act-relogin').onclick = async () => {
             qbitSessionId = null;
             GM_setValue('qbit_session', null);
-            overlay.remove();
+            closeConfig();
             showToast('Session cleared, logging in...', 'info');
             const success = await qbitLogin();
             if (success) {
@@ -391,13 +454,13 @@
         };
 
         // Quick action: Open Web UI (keep modal open so user can continue configuring)
-        document.getElementById('qbit-act-webui').onclick = () => {
+        modal.querySelector('#qbit-act-webui').onclick = () => {
             window.open(CONFIG.qbittorrent.url, '_blank', 'noopener,noreferrer');
         };
 
         // Quick action: Establish Session (Safari/iPadOS) — closes modal to show session helper
-        document.getElementById('qbit-act-session').onclick = async () => {
-            overlay.remove();
+        modal.querySelector('#qbit-act-session').onclick = async () => {
+            closeConfig();
             const established = await establishSafariSession();
             if (established) {
                 await ensureAuthenticated();
@@ -407,7 +470,7 @@
         };
 
         // Quick action: Toggle Fetch Mode
-        const fetchCheckbox = document.getElementById('qbit-act-fetch');
+        const fetchCheckbox = modal.querySelector('#qbit-act-fetch');
         const fetchLabel = modal.querySelector('label[for="qbit-act-fetch"]');
         fetchCheckbox.onchange = () => {
             forceFetchMode = fetchCheckbox.checked;
@@ -416,12 +479,21 @@
             showToast(`Fetch mode: ${forceFetchMode ? 'ON (uses CORS)' : 'OFF (uses GM_xmlhttpRequest)'}. Reload page to apply.`, 'info');
         };
 
-        document.getElementById('qbit-cfg-save').onclick = () => {
-            const url = document.getElementById('qbit-cfg-url').value.replace(/\/$/, '');
-            const username = document.getElementById('qbit-cfg-username').value;
-            const password = document.getElementById('qbit-cfg-password').value;
-            const savePath = document.getElementById('qbit-cfg-savepath').value;
-            const category = document.getElementById('qbit-cfg-category').value;
+        // Quick action: Toggle Debug Logging
+        const debugCheckbox = modal.querySelector('#qbit-act-debug');
+        const debugLabel = modal.querySelector('label[for="qbit-act-debug"]');
+        debugCheckbox.onchange = () => {
+            debugMode = debugCheckbox.checked;
+            GM_setValue('qbit_debug', debugMode);
+            debugLabel.textContent = `Debug Logging (currently ${debugMode ? 'ON' : 'OFF'})`;
+        };
+
+        modal.querySelector('#qbit-cfg-save').onclick = () => {
+            const url = modal.querySelector('#qbit-cfg-url').value.trim().replace(/\/$/, '');
+            const username = modal.querySelector('#qbit-cfg-username').value;
+            const password = modal.querySelector('#qbit-cfg-password').value;
+            const savePath = modal.querySelector('#qbit-cfg-savepath').value;
+            const category = modal.querySelector('#qbit-cfg-category').value;
 
             GM_setValue('qbit_url', url);
             GM_setValue('qbit_username', username);
@@ -429,25 +501,30 @@
             GM_setValue('qbit_savepath', savePath);
             GM_setValue('qbit_category', category);
 
-            CONFIG.qbittorrent.url = url;
-            CONFIG.qbittorrent.username = username;
-            CONFIG.qbittorrent.password = password;
-            CONFIG.savePath = savePath;
-            CONFIG.category = category;
-
+            // CONFIG reads live from GM storage, so no local copies to update.
             // Reset session to force re-auth
             qbitSessionId = null;
 
-            overlay.remove();
+            closeConfig();
             showToast('Settings saved!', 'success');
         };
 
-        document.getElementById('qbit-cfg-cancel').onclick = () => {
+        const closeConfig = () => {
+            document.removeEventListener('keydown', onConfigKeydown, true);
             overlay.remove();
         };
+        const onConfigKeydown = (e) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                closeConfig();
+            }
+        };
+        document.addEventListener('keydown', onConfigKeydown, true);
+
+        modal.querySelector('#qbit-cfg-cancel').onclick = closeConfig;
 
         overlay.onclick = (e) => {
-            if (e.target === overlay) overlay.remove();
+            if (e.target === overlay) closeConfig();
         };
     }
 
@@ -529,16 +606,9 @@
                     }
                     safariSessionPopup = null;
                     resolve(false);
-                }
+                },
+                { confirmLabel: 'Done - I\'m logged in' }
             );
-
-            // Change button text
-            setTimeout(() => {
-                const confirmBtn = document.getElementById('qbit-confirm');
-                if (confirmBtn) {
-                    confirmBtn.textContent = 'Done - I\'m logged in';
-                }
-            }, 100);
         });
     }
 
@@ -547,17 +617,21 @@
     async function qbitRequestFetch(endpoint, method, data, headers = {}) {
         const url = `${CONFIG.qbittorrent.url}${endpoint}`;
 
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
         const fetchOptions = {
             method: method,
             credentials: 'include', // Send cookies
-            headers: { ...headers }
+            headers: { ...headers },
+            signal: controller.signal
         };
 
         if (data) {
             fetchOptions.body = data;
         }
 
-        console.log(`qBittorrent API (fetch): ${method} ${endpoint}`);
+        debugLog(`qBittorrent API (fetch): ${method} ${endpoint}`);
 
         try {
             const response = await fetch(url, fetchOptions);
@@ -570,6 +644,8 @@
         } catch (error) {
             console.error('Fetch error:', error);
             throw error;
+        } finally {
+            clearTimeout(timer);
         }
     }
 
@@ -606,11 +682,15 @@
                 data: data,
                 withCredentials: true,
                 anonymous: false,
+                timeout: REQUEST_TIMEOUT_MS,
                 onload: function(response) {
                     resolve(response);
                 },
                 onerror: function(error) {
                     reject(error);
+                },
+                ontimeout: function() {
+                    reject(new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms: ${endpoint}`));
                 }
             };
 
@@ -623,16 +703,16 @@
             if (hasRealSid && !isLogin) {
                 requestOptions.cookie = `SID=${qbitSessionId}`;
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
-                console.log(`  → Cookie: SID=${qbitSessionId.substring(0, 8)}...`);
+                debugLog(`  → Cookie: SID=${qbitSessionId.substring(0, 8)}...`);
             } else if (!isLogin) {
                 // No manual cookie - rely on withCredentials to send browser cookies
-                console.log(`  → Cookie: (relying on browser cookies via withCredentials)`);
+                debugLog(`  → Cookie: (relying on browser cookies via withCredentials)`);
             }
 
-            console.log(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${hasRealSid ? 'manual' : 'browser'})`);
-            console.log(`  → URL: ${url}`);
-            console.log(`  → Origin: ${origin}`);
-            console.log(`  → Referer: ${requestHeaders['Referer']}`);
+            debugLog(`qBittorrent API (GM): ${method} ${endpoint}`, isLogin ? '(login)' : `(SID: ${hasRealSid ? 'manual' : 'browser'})`);
+            debugLog(`  → URL: ${url}`);
+            debugLog(`  → Origin: ${origin}`);
+            debugLog(`  → Referer: ${requestHeaders['Referer']}`);
 
             GM_xmlhttpRequest(requestOptions);
         });
@@ -647,7 +727,19 @@
         }
     }
 
-    async function qbitLogin(offerSafariHelper = true) {
+    // Serialize logins so concurrent addTorrent calls share one in-flight
+    // login instead of racing and clobbering each other's SID
+    let loginPromise = null;
+
+    function qbitLogin(offerSafariHelper = true) {
+        if (loginPromise) return loginPromise;
+        loginPromise = doLogin(offerSafariHelper).finally(() => {
+            loginPromise = null;
+        });
+        return loginPromise;
+    }
+
+    async function doLogin(offerSafariHelper) {
         try {
             const formData = `username=${encodeURIComponent(CONFIG.qbittorrent.username)}&password=${encodeURIComponent(CONFIG.qbittorrent.password)}`;
 
@@ -664,12 +756,12 @@
                 // When using GM_xmlhttpRequest, extract SID from response headers
                 if (!shouldUseFetch()) {
                     const cookies = response.responseHeaders;
-                    console.log('qBittorrent: Login response headers:', cookies);
+                    debugLog('qBittorrent: Login response headers:', cookies);
                     const sidMatch = cookies.match(/SID=([^;]+)/i);
                     if (sidMatch) {
                         qbitSessionId = sidMatch[1];
                         GM_setValue('qbit_session', qbitSessionId);
-                        console.log('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
+                        debugLog('qBittorrent: Login successful, SID:', qbitSessionId.substring(0, 8) + '...');
                     } else {
                         console.warn('qBittorrent: Login succeeded but no SID cookie found in response');
                         // Even without explicit SID, mark as logged in (server may use different auth)
@@ -678,35 +770,37 @@
                 } else {
                     // On Safari, mark as authenticated (browser handles cookie)
                     qbitSessionId = 'safari-auto';
-                    console.log('qBittorrent: Login successful (Safari - browser handles cookies)');
+                    debugLog('qBittorrent: Login successful (Safari - browser handles cookies)');
                 }
                 return true;
             } else if (response.status === 403) {
-                console.log('qBittorrent: 403 on login - may be CSRF or cookie issue');
+                debugLog('qBittorrent: 403 on login - may be CSRF or cookie issue');
                 // On Safari, 403 might be due to cookie/CORS issues
                 if (isSafari && offerSafariHelper) {
-                    console.log('qBittorrent: Safari detected, offering session helper');
+                    debugLog('qBittorrent: Safari detected, offering session helper');
                     const established = await establishSafariSession();
                     if (established) {
-                        // Retry login after session established
-                        return await qbitLogin(false);
+                        // Retry login after session established.
+                        // Call doLogin directly: qbitLogin would return the
+                        // still-pending loginPromise (this call) and deadlock.
+                        return await doLogin(false);
                     }
                 }
                 showToast('qBittorrent: Access denied (403). Try "Establish Session" from menu.', 'error');
                 return false;
             } else {
                 showToast('qBittorrent: Invalid username or password', 'error');
-                console.log('qBittorrent login failed:', response.status, response.responseText);
+                console.warn('qBittorrent login failed:', response.status, response.responseText);
                 return false;
             }
         } catch (error) {
             console.error('qBittorrent login error:', error);
             // On Safari, network errors might be CORS issues
             if (isSafari && offerSafariHelper) {
-                console.log('qBittorrent: Safari connection error, offering session helper');
+                debugLog('qBittorrent: Safari connection error, offering session helper');
                 const established = await establishSafariSession();
                 if (established) {
-                    return await qbitLogin(false);
+                    return await doLogin(false);
                 }
             }
             showToast('qBittorrent: Connection failed. Check your settings.', 'error');
@@ -720,12 +814,12 @@
             try {
                 const response = await qbitRequest('/api/v2/app/version', 'GET', null);
                 if (response.status === 200) {
-                    console.log('qBittorrent: Already authenticated (Safari cookies valid)');
+                    debugLog('qBittorrent: Already authenticated (Safari cookies valid)');
                     qbitSessionId = 'safari-auto';
                     return true;
                 }
             } catch (e) {
-                console.log('qBittorrent: Safari auth check failed, will login');
+                debugLog('qBittorrent: Safari auth check failed, will login');
             }
             return await qbitLogin();
         }
@@ -774,9 +868,10 @@
                 formData.append('category', CONFIG.category);
             }
 
-            // Auto-start setting
+            // Auto-start setting ('paused' for qBittorrent 4.x, 'stopped' for 5.x)
             if (!CONFIG.autoStart) {
                 formData.append('paused', 'true');
+                formData.append('stopped', 'true');
             }
 
             // Automatic Torrent Management - lets qBittorrent manage save paths
@@ -797,17 +892,17 @@
                 return true;
             } else if (response.status === 415) {
                 showToast('qBittorrent: Torrent file is not valid', 'error');
-                console.log('qBittorrent 415 error - invalid torrent. URL:', url);
+                console.warn('qBittorrent 415 error - invalid torrent. URL:', url);
                 return false;
             } else if (response.status === 403 && retryCount < 1) {
                 // Session might have expired or CSRF issue - force re-login and retry
-                console.log('qBittorrent: Got 403, forcing re-login...');
+                debugLog('qBittorrent: Got 403, forcing re-login...');
                 qbitSessionId = null;
                 GM_setValue('qbit_session', null);
                 return await addTorrentByUrl(url, torrentName, retryCount + 1);
             } else {
                 showToast(`qBittorrent: Failed to add torrent (${response.status})`, 'error');
-                console.log('qBittorrent add torrent failed:', response.status, response.responseText, response.responseHeaders);
+                console.warn('qBittorrent add torrent failed:', response.status, response.responseText, response.responseHeaders);
                 return false;
             }
         } catch (error) {
@@ -834,16 +929,20 @@
             const fileBytes = new Uint8Array(arrayBuffer);
 
             // Build multipart form data with proper binary handling
-            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substr(2);
+            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).slice(2);
 
             // Helper to convert string to Uint8Array
             const stringToBytes = (str) => new TextEncoder().encode(str);
+
+            // The filename comes from the page URL; quotes or CR/LF in it would
+            // corrupt the Content-Disposition header
+            const safeFileName = fileName.replace(/[\r\n"\\]/g, '_');
 
             // Build the parts
             const parts = [];
 
             // Add torrent file part
-            parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="${fileName}"\r\nContent-Type: application/x-bittorrent\r\n\r\n`));
+            parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="${safeFileName}"\r\nContent-Type: application/x-bittorrent\r\n\r\n`));
             parts.push(fileBytes);
             parts.push(stringToBytes('\r\n'));
 
@@ -857,9 +956,10 @@
                 parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="category"\r\n\r\n${CONFIG.category}\r\n`));
             }
 
-            // Auto-start setting
+            // Auto-start setting ('paused' for qBittorrent 4.x, 'stopped' for 5.x)
             if (!CONFIG.autoStart) {
                 parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="paused"\r\n\r\ntrue\r\n`));
+                parts.push(stringToBytes(`--${boundary}\r\nContent-Disposition: form-data; name="stopped"\r\n\r\ntrue\r\n`));
             }
 
             // Automatic Torrent Management - lets qBittorrent manage save paths
@@ -891,13 +991,13 @@
                 return true;
             } else if (response.status === 403 && retryCount < 1) {
                 // Session might have expired or CSRF issue - force re-login and retry
-                console.log('qBittorrent: Got 403, forcing re-login...');
+                debugLog('qBittorrent: Got 403, forcing re-login...');
                 qbitSessionId = null;
                 GM_setValue('qbit_session', null);
                 return await addTorrentByFile(fileBlob, fileName, retryCount + 1);
             } else {
                 showToast(`qBittorrent: Failed to add torrent (${response.status})`, 'error');
-                console.log('qBittorrent upload failed:', response.status, response.responseText);
+                console.warn('qBittorrent upload failed:', response.status, response.responseText);
                 return false;
             }
         } catch (error) {
@@ -913,7 +1013,9 @@
 
         // Use fetch on Safari/iPadOS or when forced, for better cookie handling
         if (shouldUseFetch()) {
-            console.log('qBittorrent API (fetch binary): POST', endpoint);
+            debugLog('qBittorrent API (fetch binary): POST', endpoint);
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
             try {
                 const response = await fetch(url, {
                     method: 'POST',
@@ -921,7 +1023,8 @@
                     headers: {
                         'Content-Type': `multipart/form-data; boundary=${boundary}`
                     },
-                    body: binaryData.buffer
+                    body: binaryData.buffer,
+                    signal: controller.signal
                 });
                 const responseText = await response.text();
                 return {
@@ -931,6 +1034,8 @@
             } catch (error) {
                 console.error('Fetch binary error:', error);
                 throw error;
+            } finally {
+                clearTimeout(timer);
             }
         }
 
@@ -951,11 +1056,15 @@
                 binary: true,
                 withCredentials: true,
                 anonymous: false,
+                timeout: REQUEST_TIMEOUT_MS,
                 onload: function(response) {
                     resolve(response);
                 },
                 onerror: function(error) {
                     reject(error);
+                },
+                ontimeout: function() {
+                    reject(new Error(`Upload timed out after ${REQUEST_TIMEOUT_MS}ms: ${endpoint}`));
                 }
             };
 
@@ -969,7 +1078,7 @@
                 requestHeaders['Cookie'] = `SID=${qbitSessionId}`;
             }
 
-            console.log('qBittorrent API (GM binary): POST', endpoint, hasRealSid ? '(manual SID)' : '(browser cookies)');
+            debugLog('qBittorrent API (GM binary): POST', endpoint, hasRealSid ? '(manual SID)' : '(browser cookies)');
 
             GM_xmlhttpRequest(requestOptions);
         });
@@ -989,6 +1098,7 @@
                 // which handles authenticated downloads
                 withCredentials: true,
                 anonymous: false,
+                timeout: REQUEST_TIMEOUT_MS,
                 onload: function(response) {
                     if (response.status === 200) {
                         resolve(response.response);
@@ -998,9 +1108,24 @@
                 },
                 onerror: function(error) {
                     reject(error);
+                },
+                ontimeout: function() {
+                    reject(new Error(`Download timed out after ${REQUEST_TIMEOUT_MS}ms`));
                 }
             });
         });
+    }
+
+    // Bencoded torrent files always start with 'd' (a dictionary). Trackers
+    // with an expired session often return an HTML login page with HTTP 200,
+    // which would otherwise be uploaded and rejected as an invalid torrent.
+    async function looksLikeTorrentFile(blob) {
+        try {
+            const head = new Uint8Array(await blob.slice(0, 1).arrayBuffer());
+            return head.length > 0 && head[0] === 0x64; // 'd'
+        } catch (e) {
+            return true; // can't inspect the blob - don't block the attempt
+        }
     }
 
     async function handleTorrentDownload(url, fileName) {
@@ -1008,10 +1133,18 @@
 
         try {
             const blob = await downloadTorrentFile(url);
+            if (!(await looksLikeTorrentFile(blob))) {
+                // Likely an HTML error/login page - let qBittorrent fetch the
+                // URL itself rather than uploading garbage
+                debugLog('Downloaded file is not bencoded, trying URL method');
+                showToast('Tracker sent a non-torrent response (login page?), trying URL method...', 'info');
+                await addTorrentByUrl(url, fileName);
+                return;
+            }
             await addTorrentByFile(blob, fileName);
         } catch (error) {
             // If download failed, try adding by URL (qBittorrent will download it)
-            console.log('Direct download failed, trying URL method:', error);
+            debugLog('Direct download failed, trying URL method:', error);
             await addTorrentByUrl(url, fileName);
         }
     }
@@ -1038,6 +1171,10 @@
 
         try {
             const blob = await downloadTorrentFile(url);
+            if (!(await looksLikeTorrentFile(blob))) {
+                // Still save it so the user can inspect, but warn them
+                showToast('Warning: file does not look like a torrent (tracker login page?)', 'error');
+            }
             saveBlobToComputer(blob, fileName);
             showToast(`Saved: ${fileName}`, 'success');
         } catch (error) {
@@ -1051,11 +1188,18 @@
     // ============================================
 
     function extractTorrentName(url) {
+        url = String(url);
+
         // Try to extract name from magnet link
-        if (url.startsWith('magnet:')) {
-            const dnMatch = url.match(/dn=([^&]+)/);
-            if (dnMatch) {
-                return decodeURIComponent(dnMatch[1].replace(/\+/g, ' '));
+        if (isMagnetUrl(url)) {
+            try {
+                // URLSearchParams handles decoding (including '+' as space)
+                // and doesn't throw on malformed percent-encoding
+                const query = url.slice(url.indexOf('?') + 1);
+                const dn = new URLSearchParams(query).get('dn');
+                if (dn) return dn;
+            } catch (e) {
+                // Malformed magnet - fall through
             }
             return 'Magnet link';
         }
@@ -1065,24 +1209,26 @@
             const urlObj = new URL(url);
             const pathParts = urlObj.pathname.split('/');
             const fileName = pathParts[pathParts.length - 1];
-            if (fileName && fileName.includes('.torrent')) {
-                return decodeURIComponent(fileName.replace('.torrent', ''));
+            if (fileName && fileName.toLowerCase().includes('.torrent')) {
+                return safeDecodeURIComponent(fileName.replace(/\.torrent/i, ''));
             }
         } catch (e) {
             // Invalid URL
         }
 
-        return url.substring(0, 50) + '...';
+        return url.length > 50 ? url.substring(0, 50) + '...' : url;
     }
 
     function isTorrentUrl(url) {
         if (!url) return false;
-        const lowerUrl = url.toLowerCase();
+        const lowerUrl = String(url).toLowerCase();
         return lowerUrl.endsWith('.torrent') ||
                lowerUrl.includes('.torrent?') ||
                lowerUrl.includes('/download/torrent') ||
                lowerUrl.includes('/get_torrent') ||
-               lowerUrl.includes('action=download') ||
+               // 'action=download' alone matches ordinary downloads on
+               // non-torrent sites, so require a torrent hint alongside it
+               (lowerUrl.includes('action=download') && lowerUrl.includes('torrent')) ||
                // Common torrent site patterns
                /\/torrent\/\d+\/download/.test(lowerUrl) ||
                /\/torrents\/download\/\d+/.test(lowerUrl) ||
@@ -1090,7 +1236,8 @@
     }
 
     function isMagnetUrl(url) {
-        return url && url.toLowerCase().startsWith('magnet:');
+        // Coerce: pages sometimes pass URL objects to window.open
+        return !!url && String(url).toLowerCase().startsWith('magnet:');
     }
 
     function handleLink(url, event) {
@@ -1102,7 +1249,7 @@
 
             const content = `
                 <p>Send this to qBittorrent?</p>
-                <div class="qbit-torrent-name">${torrentName}</div>
+                <div class="qbit-torrent-name">${escapeHtml(torrentName)}</div>
             `;
 
             const magnet = isMagnetUrl(url);
@@ -1141,10 +1288,20 @@
     // Click event listener
     function setupClickInterceptor() {
         document.addEventListener('click', function(event) {
-            // Find the closest anchor element
-            let target = event.target;
-            while (target && target.tagName !== 'A') {
-                target = target.parentElement;
+            // composedPath finds anchors inside shadow DOM (event.target is
+            // retargeted to the shadow host); fall back to walking parents.
+            // The typeof check skips SVG <a>, whose href is an object.
+            let target = null;
+            if (event.composedPath) {
+                target = event.composedPath().find(
+                    (el) => el.tagName === 'A' && typeof el.href === 'string'
+                ) || null;
+            } else {
+                let el = event.target;
+                while (el && el.tagName !== 'A') {
+                    el = el.parentElement;
+                }
+                target = el;
             }
 
             if (!target || !target.href) return;
@@ -1162,23 +1319,25 @@
         // Override window.open for magnet links
         const originalOpen = window.open;
         window.open = function(url, ...args) {
-            if (url && isMagnetUrl(url)) {
-                const torrentName = extractTorrentName(url);
+            if (isMagnetUrl(url)) {
+                // Coerce - pages may pass a URL object instead of a string
+                const magnetUrl = String(url);
+                const torrentName = extractTorrentName(magnetUrl);
                 if (CONFIG.showConfirmation) {
                     const content = `
                         <p>Send this to qBittorrent?</p>
-                        <div class="qbit-torrent-name">${torrentName}</div>
+                        <div class="qbit-torrent-name">${escapeHtml(torrentName)}</div>
                     `;
                     showModal('🧲 Add Torrent', content, async () => {
-                        await addTorrentByUrl(url, torrentName);
+                        await addTorrentByUrl(magnetUrl, torrentName);
                     }, null, {
                         extraButtons: [{
                             label: '🧲 Open in App',
-                            onClick: () => { window.location.href = url; }
+                            onClick: () => { window.location.href = magnetUrl; }
                         }]
                     });
                 } else {
-                    addTorrentByUrl(url, torrentName);
+                    addTorrentByUrl(magnetUrl, torrentName);
                 }
                 return null;
             }
@@ -1203,7 +1362,8 @@
     GM_registerMenuCommand('⚙️ Configure qBittorrent', showConfigModal);
 
     GM_registerMenuCommand('🔗 Add Torrent by URL', () => {
-        const url = prompt('Enter torrent URL or magnet link:');
+        const input = prompt('Enter torrent URL or magnet link:');
+        const url = input && input.trim();
         if (url) {
             if (isMagnetUrl(url)) {
                 addTorrentByUrl(url, extractTorrentName(url));
@@ -1215,21 +1375,21 @@
 
     GM_registerMenuCommand('🔌 Test Connection', async () => {
         showToast('Testing connection...', 'info');
-        console.log('qBittorrent: Starting connection test...');
-        console.log('qBittorrent: Current SID:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
+        debugLog('qBittorrent: Starting connection test...');
+        debugLog('qBittorrent: Current SID:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
 
         const success = await ensureAuthenticated();
-        console.log('qBittorrent: Auth result:', success, 'SID after auth:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
+        debugLog('qBittorrent: Auth result:', success, 'SID after auth:', qbitSessionId ? qbitSessionId.substring(0, 8) + '...' : 'none');
 
         if (success) {
             try {
                 const response = await qbitRequest('/api/v2/app/version', 'GET', null);
-                console.log('qBittorrent: Test response:', response.status, response.responseText);
+                debugLog('qBittorrent: Test response:', response.status, response.responseText);
                 if (response.status === 200) {
                     showToast(`Connected to qBittorrent ${response.responseText}`, 'success');
                 } else {
                     showToast(`Connection issue: HTTP ${response.status}`, 'error');
-                    console.log('qBittorrent test failed - full response:', response);
+                    console.warn('qBittorrent test failed - full response:', response);
                 }
             } catch (e) {
                 showToast('Connected but could not get version', 'info');
@@ -1256,23 +1416,23 @@
             setupNavigationInterceptor();
         }
 
-        console.log('qBittorrent Torrent Interceptor loaded');
-        console.log('Browser detection:', isSafari ? 'Safari/iPadOS' : 'Other browser');
-        console.log('Touch points:', navigator.maxTouchPoints);
-        console.log('Fetch mode:', forceFetchMode ? 'ON' : 'OFF');
-        console.log('Using:', shouldUseFetch() ? 'fetch API (CORS required)' : 'GM_xmlhttpRequest (CORS bypass)');
+        debugLog('qBittorrent Torrent Interceptor loaded');
+        debugLog('Browser detection:', isSafari ? 'Safari/iPadOS' : 'Other browser');
+        debugLog('Touch points:', navigator.maxTouchPoints);
+        debugLog('Fetch mode:', forceFetchMode ? 'ON' : 'OFF');
+        debugLog('Using:', shouldUseFetch() ? 'fetch API (CORS required)' : 'GM_xmlhttpRequest (CORS bypass)');
 
         if (isSafari) {
-            console.log('%c📱 Safari/iPadOS detected', 'color: #007aff; font-weight: bold');
-            console.log('  Using GM_xmlhttpRequest to bypass CORS restrictions.');
-            console.log('  If you experience 403 errors, use the "Establish Session" menu option.');
+            debugLog('%c📱 Safari/iPadOS detected', 'color: #007aff; font-weight: bold');
+            debugLog('  Using GM_xmlhttpRequest to bypass CORS restrictions.');
+            debugLog('  If you experience 403 errors, use the "Establish Session" menu option.');
         }
 
         if (shouldUseFetch()) {
-            console.log('%c⚠️ Fetch mode enabled - CORS required:', 'color: orange; font-weight: bold');
-            console.log('  1. Open qBittorrent Web UI → Options → Web UI');
-            console.log('  2. Disable "Enable Cross-Site Request Forgery (CSRF) protection"');
-            console.log('  3. Configure reverse proxy CORS headers if using one');
+            debugLog('%c⚠️ Fetch mode enabled - CORS required:', 'color: orange; font-weight: bold');
+            debugLog('  1. Open qBittorrent Web UI → Options → Web UI');
+            debugLog('  2. Disable "Enable Cross-Site Request Forgery (CSRF) protection"');
+            debugLog('  3. Configure reverse proxy CORS headers if using one');
         }
     }
 
