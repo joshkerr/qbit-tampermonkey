@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.11.0
+// @version      1.11.1
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
 // @author       joshkerr
 // @match        *://*/*
@@ -667,6 +667,48 @@
         }
     }
 
+    // Remembered per device: the background login "succeeds" but its cookie
+    // never becomes usable (iOS/iPadOS). When true, a tap can go straight to
+    // the Web UI tab instead of discovering that again after the gesture is gone.
+    let safariNeedsTabLogin = GM_getValue('qbit_needs_tab_login', false);
+    function setSafariNeedsTabLogin(value) {
+        if (safariNeedsTabLogin === value) return;
+        safariNeedsTabLogin = value;
+        GM_setValue('qbit_needs_tab_login', value);
+        debugLog('qBittorrent: needs Web UI tab sign-in =', value);
+    }
+
+    // Pre-warm: probe the session while the Add dialog is open so that, if it
+    // is stale, the tap on "Add" can open the sign-in tab *inside* the user
+    // gesture — Safari's pop-up blocker only allows window.open during one.
+    const PREWARM_FRESH_MS = 5 * 60 * 1000;
+    let safariProbeOk = null;   // last probe result (true/false) or null
+    let safariProbeAt = 0;
+    let safariProbePromise = null;
+
+    function prewarmSafariSession() {
+        if (!isSafari || shouldUseFetch() || safariProbePromise) return;
+        safariProbePromise = probeSession()
+            .then((ok) => {
+                safariProbeOk = ok;
+                safariProbeAt = Date.now();
+                debugLog('qBittorrent: pre-warm probe ->', ok ? 'session ok' : 'session stale');
+            })
+            .finally(() => { safariProbePromise = null; });
+    }
+
+    // Call synchronously from a click/tap handler (before any await).
+    // Resolves true when it's fine to proceed with the add.
+    function signInFromGestureIfNeeded() {
+        const stale = safariProbeOk === false && (Date.now() - safariProbeAt) < PREWARM_FRESH_MS;
+        if (!isSafari || shouldUseFetch() || !safariNeedsTabLogin || !stale) {
+            return Promise.resolve(true);
+        }
+        safariProbeOk = null;
+        debugLog('qBittorrent: session known stale, opening sign-in tab from gesture');
+        return autoLoginViaTab(); // window.open runs synchronously, inside the gesture
+    }
+
     // Serialize so concurrent adds share one sign-in tab
     let autoLoginInFlight = null;
 
@@ -1057,10 +1099,14 @@
 
         const loggedIn = await qbitLogin();
         if (loggedIn && await probeSession()) {
+            setSafariNeedsTabLogin(false);
             return true;
         }
         if (!loggedIn && lastLoginError === 'credentials') {
             return false; // the Web UI tab would fail the same way
+        }
+        if (loggedIn || lastLoginError === 'denied') {
+            setSafariNeedsTabLogin(true);
         }
 
         // Login didn't produce a usable session (typical on iOS/iPadOS: the
@@ -1487,7 +1533,10 @@
                     onClick: () => handleLocalDownload(url, torrentName + '.torrent')
                   }];
 
+            prewarmSafariSession();
             showModal('🧲 Add Torrent', content, async () => {
+                // Runs synchronously inside the tap: may open the sign-in tab
+                if (!await signInFromGestureIfNeeded()) return;
                 if (magnet) {
                     await addTorrentByUrl(url, torrentName);
                 } else {
@@ -1498,11 +1547,15 @@
             event.preventDefault();
             event.stopPropagation();
 
-            if (isMagnetUrl(url)) {
-                addTorrentByUrl(url, torrentName);
-            } else {
-                handleTorrentDownload(url, torrentName + '.torrent');
-            }
+            // Runs synchronously inside the click: may open the sign-in tab
+            signInFromGestureIfNeeded().then((ok) => {
+                if (!ok) return;
+                if (isMagnetUrl(url)) {
+                    addTorrentByUrl(url, torrentName);
+                } else {
+                    handleTorrentDownload(url, torrentName + '.torrent');
+                }
+            });
         }
     }
 
@@ -1549,7 +1602,9 @@
                         <p>Send this to qBittorrent?</p>
                         <div class="qbit-torrent-name">${escapeHtml(torrentName)}</div>
                     `;
+                    prewarmSafariSession();
                     showModal('🧲 Add Torrent', content, async () => {
+                        if (!await signInFromGestureIfNeeded()) return;
                         await addTorrentByUrl(magnetUrl, torrentName);
                     }, null, {
                         extraButtons: [{
@@ -1558,7 +1613,9 @@
                         }]
                     });
                 } else {
-                    addTorrentByUrl(magnetUrl, torrentName);
+                    signInFromGestureIfNeeded().then((ok) => {
+                        if (ok) addTorrentByUrl(magnetUrl, torrentName);
+                    });
                 }
                 return null;
             }
@@ -1644,6 +1701,12 @@
             setupClickInterceptor();
             setupMagnetProtocolInterceptor();
             setupNavigationInterceptor();
+        }
+
+        // Without a confirmation dialog there is no moment to pre-warm before
+        // the click, so probe at load on devices known to need the tab sign-in
+        if (isSafari && safariNeedsTabLogin && !CONFIG.showConfirmation) {
+            prewarmSafariSession();
         }
 
         debugLog('qBittorrent Torrent Interceptor loaded');

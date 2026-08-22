@@ -145,7 +145,7 @@ Safari extensions can't attach the qBittorrent session cookie to requests themse
 2. The script instance running on that page signs in with your saved credentials (same-origin, so Safari stores the cookie), then closes the tab.
 3. The original tab notices the session is ready and finishes adding the torrent.
 
-If Safari's pop-up blocker stops the tab from opening, you'll see a **Sign in to qBittorrent** prompt — tap **Open qBittorrent** and the same thing happens. You can also trigger it manually from **Configure qBittorrent → Sign in via Web UI**.
+The first time this happens Safari's pop-up blocker may stop the tab from opening, in which case you'll see a **Sign in to qBittorrent** prompt — tap **Open qBittorrent** and the same thing happens. After that the script remembers that this device needs the tab sign-in and checks the session while the Add dialog is open, so your tap on **Add to qBittorrent** opens the tab directly with no extra prompt. You can also trigger it manually from **Configure qBittorrent → Sign in via Web UI**.
 
 If the automatic sign-in fails (e.g. wrong credentials), the qBittorrent tab stays open on its login page so you can log in by hand, then go back and tap **Retry**. The sign-in repeats whenever the qBittorrent session expires (qBittorrent's Web UI session timeout, 1 hour by default — raise it in qBittorrent → Options → Web UI to see it less often).
 
