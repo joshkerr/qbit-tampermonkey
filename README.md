@@ -12,7 +12,7 @@ A Tampermonkey userscript that intercepts torrent file downloads and magnet link
 - **Toast Notifications** - Visual feedback when torrents are added
 - **Configurable Settings** - Set your qBittorrent URL, credentials, save path, and category
 - **Dark Mode Support** - UI adapts to your system theme
-- **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey
+- **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey (on iOS/iPadOS the script signs in to qBittorrent for you via a short-lived Web UI tab — no need to log in manually first)
 
 ## Prerequisites
 
@@ -89,7 +89,7 @@ Click the Tampermonkey icon to access:
 
 ![Tampermonkey Menu](screenshots/dropdown.png)
 
-- **Configure qBittorrent** - Open settings dialog (includes Quick Actions for Force Re-login, Open Web UI, Establish Session, plus Fetch Mode and Debug Logging toggles)
+- **Configure qBittorrent** - Open settings dialog (includes Quick Actions for Force Re-login, Open Web UI, Sign in via Web UI, plus Fetch Mode and Debug Logging toggles)
 - **Add Torrent by URL** - Manually enter a magnet or torrent URL
 - **Test Connection** - Verify qBittorrent connectivity
 
@@ -136,6 +136,18 @@ The script will:
 
 1. **Permissions**: Safari may block cross-origin requests. Go to Tampermonkey preferences and ensure "Allow all hosts" is enabled
 2. **Web Inspector**: Enable Developer menu (Safari → Preferences → Advanced → Show Develop menu) to debug issues
+
+### iOS / iPadOS: how sign-in works
+
+Safari extensions can't attach the qBittorrent session cookie to requests themselves, and on iOS/iPadOS the cookie from the script's own login never lands in Safari's cookie jar. Previously you had to open the qBittorrent Web UI in a tab and log in by hand before torrents would go through. The script now handles this automatically:
+
+1. When a torrent is added and qBittorrent rejects the session, the script opens your qBittorrent Web UI in a new tab.
+2. The script instance running on that page signs in with your saved credentials (same-origin, so Safari stores the cookie), then closes the tab.
+3. The original tab notices the session is ready and finishes adding the torrent.
+
+If Safari's pop-up blocker stops the tab from opening, you'll see a **Sign in to qBittorrent** prompt — tap **Open qBittorrent** and the same thing happens. You can also trigger it manually from **Configure qBittorrent → Sign in via Web UI**.
+
+If the automatic sign-in fails (e.g. wrong credentials), the qBittorrent tab stays open on its login page so you can log in by hand, then go back and tap **Retry**. The sign-in repeats whenever the qBittorrent session expires (qBittorrent's Web UI session timeout, 1 hour by default — raise it in qBittorrent → Options → Web UI to see it less often).
 
 ## Security Notes
 

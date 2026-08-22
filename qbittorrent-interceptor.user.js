@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.10.0
+// @version      1.11.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
 // @author       joshkerr
 // @match        *://*/*
@@ -382,6 +382,8 @@
         overlay.onclick = (e) => {
             if (e.target === overlay) cancel();
         };
+
+        return { close };
     }
 
     function showConfigModal() {
@@ -419,7 +421,7 @@
                 <div class="qbit-actions-grid">
                     <button class="qbit-action-btn" id="qbit-act-relogin">🔄 Force Re-login</button>
                     <button class="qbit-action-btn" id="qbit-act-webui">📊 Open Web UI</button>
-                    <button class="qbit-action-btn" id="qbit-act-session">🔑 Establish Session</button>
+                    <button class="qbit-action-btn" id="qbit-act-session">🔑 Sign in via Web UI</button>
                 </div>
                 <div class="qbit-toggle-row">
                     <input type="checkbox" id="qbit-act-fetch" ${forceFetchMode ? 'checked' : ''}>
@@ -447,7 +449,9 @@
             GM_setValue('qbit_session', null);
             closeConfig();
             showToast('Session cleared, logging in...', 'info');
-            const success = await qbitLogin();
+            // On Safari this verifies the session actually stuck (and falls
+            // back to the Web UI tab sign-in if it didn't)
+            const success = isSafari ? await ensureAuthenticatedSafari() : await qbitLogin();
             if (success) {
                 showToast('Re-login successful!', 'success');
             }
@@ -458,15 +462,11 @@
             window.open(CONFIG.qbittorrent.url, '_blank', 'noopener,noreferrer');
         };
 
-        // Quick action: Establish Session (Safari/iPadOS) — closes modal to show session helper
-        modal.querySelector('#qbit-act-session').onclick = async () => {
+        // Quick action: Sign in via Web UI tab (Safari/iOS/iPadOS cookie session).
+        // Called straight from the click so window.open keeps the user gesture.
+        modal.querySelector('#qbit-act-session').onclick = () => {
             closeConfig();
-            const established = await establishSafariSession();
-            if (established) {
-                await ensureAuthenticated();
-            } else {
-                showToast('Could not establish session', 'error');
-            }
+            autoLoginViaTab();
         };
 
         // Quick action: Toggle Fetch Mode
@@ -552,63 +552,256 @@
     // Determine if we should use fetch - now OFF by default (requires explicit opt-in)
     const shouldUseFetch = () => forceFetchMode;
 
-    // Track if we've shown the Safari session helper
-    let safariSessionPopup = null;
-    let safariSessionEstablished = GM_getValue('qbit_safari_session', false);
+    // ============================================
+    // SAFARI / iOS SESSION VIA WEB UI TAB
+    // ============================================
+    // Safari extensions can't set a Cookie header, so on Safari the SID only
+    // reaches qBittorrent if it is in Safari's own cookie jar. On macOS the
+    // background login's Set-Cookie lands there; on iOS/iPadOS it does not.
+    // Workaround: this script also runs on the qBittorrent Web UI origin, so
+    // we open the Web UI in a new tab with a marker in the hash, and the
+    // script instance on that page logs in with a same-origin fetch (no CORS,
+    // CSRF passes, cookie is stored first-party). Then it closes itself and
+    // the original tab resumes.
 
-    // Helper to establish session on Safari/iPadOS by opening qBittorrent in a popup
-    async function establishSafariSession() {
-        return new Promise((resolve) => {
-            const popupWidth = 600;
-            const popupHeight = 500;
-            const left = (screen.width - popupWidth) / 2;
-            const top = (screen.height - popupHeight) / 2;
+    const AUTOLOGIN_HASH_RE = /^#qbit-autologin=([A-Za-z0-9]+)$/;
+    const AUTOLOGIN_TIMEOUT_MS = 120000;
 
-            showToast('Opening qBittorrent to establish session...', 'info');
+    // Configured qBittorrent URL without trailing slashes
+    function qbitBaseUrl() {
+        return CONFIG.qbittorrent.url.replace(/\/+$/, '');
+    }
 
-            safariSessionPopup = window.open(
-                CONFIG.qbittorrent.url,
-                'qbit_session',
-                `width=${popupWidth},height=${popupHeight},left=${left},top=${top},resizable=yes`
-            );
+    // Is this page the qBittorrent Web UI opened by autoLoginViaTab()?
+    function getAutoLoginNonce() {
+        const m = location.hash.match(AUTOLOGIN_HASH_RE);
+        if (!m) return null;
+        if (location.origin !== getOriginFromUrl(CONFIG.qbittorrent.url)) return null;
+        return m[1];
+    }
 
-            if (!safariSessionPopup) {
-                showToast('Popup blocked! Please allow popups for this site.', 'error');
-                resolve(false);
-                return;
+    // Runs on the qBittorrent Web UI page: log in same-origin, report back, close.
+    function runAutoLoginPage(nonce) {
+        const base = qbitBaseUrl();
+
+        const report = (ok, reason = '') => {
+            try {
+                GM_setValue('qbit_autologin_result', { nonce, ok, reason, ts: Date.now() });
+            } catch (e) { /* storage unavailable */ }
+            try {
+                // Only the nonce and outcome cross origins here — no secrets
+                if (window.opener) {
+                    window.opener.postMessage({ type: 'qbit-autologin', nonce, ok, reason }, '*');
+                }
+            } catch (e) { /* opener gone */ }
+        };
+
+        const whenBodyReady = (fn) => {
+            if (document.body) fn();
+            else document.addEventListener('DOMContentLoaded', fn, { once: true });
+        };
+
+        const probe = async () => {
+            const r = await fetch(`${base}/api/v2/app/version`, { credentials: 'same-origin', cache: 'no-store' });
+            return r.status === 200;
+        };
+
+        (async () => {
+            let ok = false;
+            let reason = '';
+            try {
+                ok = await probe();
+                if (!ok) {
+                    const body = new URLSearchParams({
+                        username: CONFIG.qbittorrent.username,
+                        password: CONFIG.qbittorrent.password,
+                    });
+                    const r = await fetch(`${base}/api/v2/auth/login`, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                    });
+                    const text = await r.text();
+                    if (r.status === 200 && text === 'Ok.') {
+                        ok = await probe();
+                        if (!ok) reason = 'cookie';
+                    } else if (r.status === 200) {
+                        reason = 'credentials'; // qBittorrent answers "Fails."
+                    } else {
+                        reason = `http ${r.status}`;
+                    }
+                }
+            } catch (e) {
+                console.error('qBittorrent auto sign-in error:', e);
+                reason = 'network';
             }
 
-            // Show instructions
-            showModal(
-                '🔑 Establish qBittorrent Session',
-                `<p>A popup window has opened to qBittorrent.</p>
-                 <p><strong>Instructions:</strong></p>
-                 <ol style="margin: 10px 0; padding-left: 20px;">
-                   <li>Log in to qBittorrent in the popup</li>
-                   <li>Once logged in, click "Done" below</li>
-                 </ol>
-                 <p style="color: #888; font-size: 12px;">This establishes browser cookies needed for Safari/iPadOS.</p>`,
-                () => {
-                    // User clicked Done
-                    if (safariSessionPopup && !safariSessionPopup.closed) {
-                        safariSessionPopup.close();
+            debugLog('qBittorrent: Web UI auto sign-in', ok ? 'succeeded' : `failed (${reason})`);
+            report(ok, reason);
+
+            if (ok) {
+                // Close the tab if we were opened by the script; otherwise just
+                // show the (now signed-in) Web UI without the marker.
+                window.close();
+                setTimeout(() => location.replace(`${base}/`), 500);
+            } else {
+                // Leave the login page up so the user can sign in by hand;
+                // strip the marker so a reload doesn't retry.
+                try { history.replaceState(null, '', `${base}/`); } catch (e) { /* ignore */ }
+                const hint = reason === 'credentials'
+                    ? 'qBittorrent auto sign-in failed: wrong username or password. Log in here, then go back to the previous tab.'
+                    : `qBittorrent auto sign-in failed (${reason}). Log in here, then go back to the previous tab.`;
+                whenBodyReady(() => showToast(hint, 'error'));
+            }
+        })();
+    }
+
+    // Probe the API with whatever cookies Safari has for the qBittorrent origin
+    async function probeSession() {
+        try {
+            const response = await qbitRequest('/api/v2/app/version', 'GET', null);
+            return response.status === 200;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Serialize so concurrent adds share one sign-in tab
+    let autoLoginInFlight = null;
+
+    function autoLoginViaTab() {
+        if (autoLoginInFlight) return autoLoginInFlight;
+        autoLoginInFlight = doAutoLoginViaTab().finally(() => {
+            autoLoginInFlight = null;
+        });
+        return autoLoginInFlight;
+    }
+
+    async function doAutoLoginViaTab() {
+        const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        const loginUrl = `${qbitBaseUrl()}/#qbit-autologin=${nonce}`;
+        try { GM_setValue('qbit_autologin_result', null); } catch (e) { /* ignore */ }
+
+        const openTab = () => {
+            try { return window.open(loginUrl, '_blank'); } catch (e) { return null; }
+        };
+
+        let win = openTab();
+        if (!win) {
+            // Pop-up blocked (we're past the click's user gesture) — ask for a tap
+            const tapped = await new Promise((resolve) => {
+                showModal(
+                    '🔑 Sign in to qBittorrent',
+                    `<p>Safari needs a cookie session for qBittorrent. Tap below to open qBittorrent in a new tab — the script will sign in automatically and come back here.</p>`,
+                    () => { win = openTab(); resolve(true); },
+                    () => resolve(false),
+                    { confirmLabel: 'Open qBittorrent' }
+                );
+            });
+            if (!tapped) return false;
+            if (!win) {
+                showToast('Safari blocked the qBittorrent tab. Allow pop-ups for this site and try again.', 'error');
+                return false;
+            }
+        }
+
+        // Rely on Safari's cookie jar from here on (a stale manual SID would only get in the way)
+        qbitSessionId = 'safari-auto';
+        GM_setValue('qbit_session', null);
+
+        return waitForTabLogin(win, nonce);
+    }
+
+    // Wait until the qBittorrent session is usable from this tab. Listens for
+    // the sign-in tab's signal (postMessage / GM storage / tab closed) and also
+    // polls the API directly, so it works even if none of the signals arrive.
+    function waitForTabLogin(win, nonce) {
+        return new Promise((resolve) => {
+            let done = false;
+            let probing = false;
+            let modal = null;
+            const startedAt = Date.now();
+
+            const waitingHtml = `
+                <p>Opened qBittorrent in a new tab to sign in. This will continue automatically once the session is ready.</p>
+                <p style="color: #888; font-size: 12px;">If nothing happens, log in manually in the qBittorrent tab, come back here, and tap Retry.</p>`;
+            const failedHtml = `
+                <p>Automatic sign-in failed in the qBittorrent tab (check the username and password in settings).</p>
+                <p style="color: #888; font-size: 12px;">You can log in manually in that tab, then come back here and tap Retry.</p>`;
+
+            const openModal = (html) => {
+                if (modal) modal.close();
+                modal = showModal(
+                    '🔑 Signing in to qBittorrent…',
+                    html,
+                    () => { modal = null; check(true); },
+                    () => { modal = null; finish(false); },
+                    { confirmLabel: 'Retry' }
+                );
+            };
+
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                clearInterval(timer);
+                window.removeEventListener('message', onMessage);
+                if (modal) { modal.close(); modal = null; }
+                if (ok) {
+                    debugLog('qBittorrent: Session established via Web UI tab');
+                    showToast('qBittorrent session ready', 'success');
+                } else {
+                    showToast('Could not establish a qBittorrent session', 'error');
+                }
+                resolve(ok);
+            };
+
+            const check = async (fromRetry = false) => {
+                if (done || probing) return;
+                probing = true;
+                const ok = await probeSession();
+                probing = false;
+                if (done) return;
+                if (ok) {
+                    finish(true);
+                } else if (fromRetry) {
+                    showToast('Not signed in yet', 'error');
+                    openModal(waitingHtml);
+                }
+            };
+
+            const onSignal = (ok) => {
+                if (ok) check();
+                else if (modal) openModal(failedHtml);
+            };
+
+            const onMessage = (e) => {
+                const d = e.data;
+                if (d && d.type === 'qbit-autologin' && d.nonce === nonce) onSignal(!!d.ok);
+            };
+            window.addEventListener('message', onMessage);
+
+            let ticks = 0;
+            let signalSeen = false;
+            const timer = setInterval(() => {
+                if (done) return;
+                ticks++;
+                if (!signalSeen) {
+                    let r = null;
+                    try { r = GM_getValue('qbit_autologin_result', null); } catch (e) { /* ignore */ }
+                    if (r && r.nonce === nonce) {
+                        signalSeen = true;
+                        onSignal(!!r.ok);
                     }
-                    safariSessionPopup = null;
-                    safariSessionEstablished = true;
-                    GM_setValue('qbit_safari_session', true);
-                    showToast('Session established! Retrying...', 'success');
-                    resolve(true);
-                },
-                () => {
-                    // User clicked Cancel
-                    if (safariSessionPopup && !safariSessionPopup.closed) {
-                        safariSessionPopup.close();
-                    }
-                    safariSessionPopup = null;
-                    resolve(false);
-                },
-                { confirmLabel: 'Done - I\'m logged in' }
-            );
+                }
+                // Tab closed itself (success path) or user closed it — check now
+                if (win && win.closed) check();
+                // Fallback: poll the API every 2s regardless of signals
+                if (ticks % 4 === 0) check();
+                if (Date.now() - startedAt > AUTOLOGIN_TIMEOUT_MS) finish(false);
+            }, 500);
+
+            openModal(waitingHtml);
         });
     }
 
@@ -730,16 +923,19 @@
     // Serialize logins so concurrent addTorrent calls share one in-flight
     // login instead of racing and clobbering each other's SID
     let loginPromise = null;
+    // Why the last login failed: 'credentials' | 'denied' | 'network' | null
+    let lastLoginError = null;
 
-    function qbitLogin(offerSafariHelper = true) {
+    function qbitLogin() {
         if (loginPromise) return loginPromise;
-        loginPromise = doLogin(offerSafariHelper).finally(() => {
+        loginPromise = doLogin().finally(() => {
             loginPromise = null;
         });
         return loginPromise;
     }
 
-    async function doLogin(offerSafariHelper) {
+    async function doLogin() {
+        lastLoginError = null;
         try {
             const formData = `username=${encodeURIComponent(CONFIG.qbittorrent.username)}&password=${encodeURIComponent(CONFIG.qbittorrent.password)}`;
 
@@ -773,36 +969,30 @@
                     debugLog('qBittorrent: Login successful (Safari - browser handles cookies)');
                 }
                 return true;
-            } else if (response.status === 403) {
-                debugLog('qBittorrent: 403 on login - may be CSRF or cookie issue');
-                // On Safari, 403 might be due to cookie/CORS issues
-                if (isSafari && offerSafariHelper) {
-                    debugLog('qBittorrent: Safari detected, offering session helper');
-                    const established = await establishSafariSession();
-                    if (established) {
-                        // Retry login after session established.
-                        // Call doLogin directly: qbitLogin would return the
-                        // still-pending loginPromise (this call) and deadlock.
-                        return await doLogin(false);
-                    }
+            } else if (response.status === 200) {
+                // qBittorrent answers 200 "Fails." for a wrong username/password
+                lastLoginError = 'credentials';
+                showToast('qBittorrent: Invalid username or password', 'error');
+                console.warn('qBittorrent login failed:', response.status, response.responseText);
+                return false;
+            } else if (response.status === 403 || response.status === 401) {
+                // 403: IP banned after failed attempts; 401: CSRF/Origin check rejected us
+                lastLoginError = 'denied';
+                debugLog(`qBittorrent: ${response.status} on login - CSRF/Origin or cookie issue`);
+                // On Safari the caller falls back to signing in via a Web UI tab
+                if (!isSafari) {
+                    showToast(`qBittorrent: Access denied (${response.status}) on login`, 'error');
                 }
-                showToast('qBittorrent: Access denied (403). Try "Establish Session" from menu.', 'error');
                 return false;
             } else {
-                showToast('qBittorrent: Invalid username or password', 'error');
+                lastLoginError = 'denied';
+                showToast(`qBittorrent: Login failed (HTTP ${response.status})`, 'error');
                 console.warn('qBittorrent login failed:', response.status, response.responseText);
                 return false;
             }
         } catch (error) {
+            lastLoginError = 'network';
             console.error('qBittorrent login error:', error);
-            // On Safari, network errors might be CORS issues
-            if (isSafari && offerSafariHelper) {
-                debugLog('qBittorrent: Safari connection error, offering session helper');
-                const established = await establishSafariSession();
-                if (established) {
-                    return await doLogin(false);
-                }
-            }
             showToast('qBittorrent: Connection failed. Check your settings.', 'error');
             return false;
         }
@@ -824,9 +1014,13 @@
             return await qbitLogin();
         }
 
-        // For non-Safari: try to restore session from storage
+        // Try to restore session from storage
         if (!qbitSessionId) {
             qbitSessionId = GM_getValue('qbit_session', null);
+        }
+
+        if (isSafari) {
+            return await ensureAuthenticatedSafari();
         }
 
         // Check if we're already authenticated by making a simple API call
@@ -846,6 +1040,33 @@
         }
 
         return await qbitLogin();
+    }
+
+    // Safari: a manual Cookie header is ignored, so what matters is whether
+    // Safari's own cookie jar holds a valid SID. Probe first, then try the
+    // normal login and verify it stuck, and finally fall back to signing in
+    // from a qBittorrent Web UI tab (needed on iOS/iPadOS).
+    async function ensureAuthenticatedSafari() {
+        if (await probeSession()) {
+            if (!qbitSessionId) qbitSessionId = 'safari-auto';
+            debugLog('qBittorrent: Already authenticated (Safari cookies valid)');
+            return true;
+        }
+        qbitSessionId = null;
+        GM_setValue('qbit_session', null);
+
+        const loggedIn = await qbitLogin();
+        if (loggedIn && await probeSession()) {
+            return true;
+        }
+        if (!loggedIn && lastLoginError === 'credentials') {
+            return false; // the Web UI tab would fail the same way
+        }
+
+        // Login didn't produce a usable session (typical on iOS/iPadOS: the
+        // background request's Set-Cookie never reaches Safari's jar)
+        debugLog('qBittorrent: Session not usable after login, signing in via Web UI tab');
+        return await autoLoginViaTab();
     }
 
     async function addTorrentByUrl(url, torrentName = '', retryCount = 0) {
@@ -1403,6 +1624,15 @@
     // ============================================
 
     function init() {
+        // If this is the qBittorrent Web UI opened by autoLoginViaTab(),
+        // sign in same-origin and hand the session back — nothing else to do here
+        const autoLoginNonce = getAutoLoginNonce();
+        if (autoLoginNonce) {
+            debugLog('qBittorrent: Web UI auto sign-in page detected');
+            runAutoLoginPage(autoLoginNonce);
+            return;
+        }
+
         // Wait for DOM to be ready
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
@@ -1425,7 +1655,7 @@
         if (isSafari) {
             debugLog('%c📱 Safari/iPadOS detected', 'color: #007aff; font-weight: bold');
             debugLog('  Using GM_xmlhttpRequest to bypass CORS restrictions.');
-            debugLog('  If you experience 403 errors, use the "Establish Session" menu option.');
+            debugLog('  If the session never sticks (iOS/iPadOS), the script signs in via a Web UI tab automatically.');
         }
 
         if (shouldUseFetch()) {
