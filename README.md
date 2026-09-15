@@ -12,7 +12,7 @@ A Tampermonkey userscript that intercepts torrent file downloads and magnet link
 - **Toast Notifications** - Visual feedback when torrents are added
 - **Configurable Settings** - Set your qBittorrent URL, credentials, save path, and category
 - **Dark Mode Support** - UI adapts to your system theme
-- **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey (on iOS/iPadOS the script signs in to qBittorrent for you via a short-lived Web UI tab — no need to log in manually first)
+- **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey (on iOS/iPadOS the script signs in to qBittorrent for you in the background — no need to log in manually first)
 
 ## Prerequisites
 
@@ -139,15 +139,17 @@ The script will:
 
 ### iOS / iPadOS: how sign-in works
 
-Safari extensions can't attach the qBittorrent session cookie to requests themselves, and on iOS/iPadOS the cookie from the script's own login never lands in Safari's cookie jar. Previously you had to open the qBittorrent Web UI in a tab and log in by hand before torrents would go through. The script now handles this automatically:
+Safari extensions can't attach the qBittorrent session cookie to requests themselves, and on iOS/iPadOS the cookie from the script's own login never lands in Safari's cookie jar. Previously you had to open the qBittorrent Web UI in a tab and log in by hand before torrents would go through. The script handles this for you, trying the least intrusive option first.
 
-1. When a torrent is added and qBittorrent rejects the session, the script opens your qBittorrent Web UI in a new tab.
-2. The script instance running on that page signs in with your saved credentials (same-origin, so Safari stores the cookie), then closes the tab.
-3. The original tab notices the session is ready and finishes adding the torrent.
+**1. Silently, via the cookie API (preferred).** The script signs in to qBittorrent in the background, takes the `SID` out of the response, and writes it straight into the browser's cookie jar with `GM_cookie` — replaying the exact attributes qBittorrent sent (path, `HttpOnly`, `Secure`, `SameSite`). Nothing opens and nothing flashes on screen. This needs a userscript manager that grants `GM_cookie`; Tampermonkey asks for the cookie permission the first time, so **allow it** if prompted.
 
-The first time this happens Safari's pop-up blocker may stop the tab from opening, in which case you'll see a **Sign in to qBittorrent** prompt — tap **Open qBittorrent** and the same thing happens. After that the script remembers that this device needs the tab sign-in and checks the session while the Add dialog is open, so your tap on **Add to qBittorrent** opens the tab directly with no extra prompt. You can also trigger it manually from **Configure qBittorrent → Sign in via Web UI**.
+**2. A background tab.** If `GM_cookie` isn't available or is refused, the script opens the Web UI with `GM_openInTab` in a *background* tab, so focus stays on the page you're reading. The script instance on that page signs in same-origin (Safari stores the cookie), reports back, and the tab is closed. If it hasn't finished after ten seconds — an iOS background tab can be suspended — you'll get a prompt asking you to switch to it.
 
-If the automatic sign-in fails (e.g. wrong credentials), the qBittorrent tab stays open on its login page so you can log in by hand, then go back and tap **Retry**. The sign-in repeats whenever the qBittorrent session expires (qBittorrent's Web UI session timeout, 1 hour by default — raise it in qBittorrent → Options → Web UI to see it less often).
+**3. A foreground tab.** Only if neither API exists. This is the old behaviour: the tab opens in front of you, signs in, and closes itself. Safari's pop-up blocker may stop it the first time, in which case you'll see a **Sign in to qBittorrent** prompt — tap **Open qBittorrent**.
+
+You can trigger a sign-in manually from **Configure qBittorrent → Sign in via Web UI**, and **Force Re-login** clears the session and re-tests the silent path.
+
+If the automatic sign-in fails (e.g. wrong credentials), the qBittorrent tab stays open on its login page so you can log in by hand, then go back and tap **Retry**. The sign-in repeats whenever the qBittorrent session expires (qBittorrent's Web UI session timeout, 1 hour by default — raise it in qBittorrent → Options → Web UI to see it less often). If your server is only reachable on your LAN, **Options → Web UI → Bypass authentication for clients in whitelisted IP subnets** removes the sign-in entirely.
 
 ## Security Notes
 

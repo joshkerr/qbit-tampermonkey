@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.11.1
+// @version      1.12.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
 // @author       joshkerr
 // @match        *://*/*
@@ -11,6 +11,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
 // @grant        GM_addStyle
+// @grant        GM_openInTab
+// @grant        GM_cookie
 // @connect      *
 // @run-at       document-start
 // @noframes
@@ -447,6 +449,8 @@
         modal.querySelector('#qbit-act-relogin').onclick = async () => {
             qbitSessionId = null;
             GM_setValue('qbit_session', null);
+            // Give the silent cookie path another chance (permissions may have changed)
+            setCookieApiBroken(false);
             closeConfig();
             showToast('Session cleared, logging in...', 'info');
             // On Safari this verifies the session actually stuck (and falls
@@ -564,7 +568,7 @@
     // CSRF passes, cookie is stored first-party). Then it closes itself and
     // the original tab resumes.
 
-    const AUTOLOGIN_HASH_RE = /^#qbit-autologin=([A-Za-z0-9]+)$/;
+    const AUTOLOGIN_HASH_RE = /^#qbit-autologin=([A-Za-z0-9]+)(&bg)?$/;
     const AUTOLOGIN_TIMEOUT_MS = 120000;
 
     // Configured qBittorrent URL without trailing slashes
@@ -572,16 +576,110 @@
         return CONFIG.qbittorrent.url.replace(/\/+$/, '');
     }
 
+    // ============================================
+    // SILENT SESSION VIA THE COOKIE API
+    // ============================================
+    // Opening a tab is only needed because the SID has to end up in the
+    // browser's own cookie jar. GM_cookie writes there directly, so where the
+    // userscript manager offers it we can take the SID from the background
+    // login and install it without anything appearing on screen.
+
+    const hasCookieApi = () => typeof GM_cookie !== 'undefined' && GM_cookie && typeof GM_cookie.set === 'function';
+
+    // Remembered per device: the manager exposes GM_cookie but refuses the
+    // write (missing permission). Cleared by "Force Re-login".
+    let cookieApiBroken = GM_getValue('qbit_cookie_api_broken', false);
+    function setCookieApiBroken(value) {
+        if (cookieApiBroken === value) return;
+        cookieApiBroken = value;
+        GM_setValue('qbit_cookie_api_broken', value);
+    }
+
+    // True when a stale session can be repaired without opening anything
+    const silentSignInAvailable = () => hasCookieApi() && !cookieApiBroken;
+
+    // Replicate the attributes qBittorrent sent with its SID; guessing them
+    // (SameSite in particular) is what decides whether Safari hands the cookie
+    // back on the script's cross-site requests.
+    function parseSidAttributes(responseHeaders) {
+        const line = String(responseHeaders || '')
+            .split(/\r?\n/)
+            .find((l) => /^set-cookie:/i.test(l) && /SID=/i.test(l)) || '';
+        const attrs = { path: '/', httpOnly: /;\s*httponly/i.test(line), secure: /;\s*secure/i.test(line) };
+        const path = line.match(/;\s*path=([^;]+)/i);
+        if (path) attrs.path = path[1].trim();
+        const sameSite = line.match(/;\s*samesite=([^;]+)/i);
+        if (sameSite) {
+            const v = sameSite[1].trim().toLowerCase();
+            attrs.sameSite = v === 'none' ? 'no_restriction' : v; // 'lax' | 'strict' | 'no_restriction'
+        }
+        return attrs;
+    }
+
+    // GM_cookie.set is callback-based in some managers and promise-based in
+    // others, and simply absent in older ones. Resolve false rather than throw.
+    function gmCookieSet(details) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const done = (error) => {
+                if (settled) return;
+                settled = true;
+                if (error) debugLog('qBittorrent: GM_cookie.set error:', error);
+                resolve(!error);
+            };
+            const timer = setTimeout(() => done('timeout'), 5000);
+            const finish = (error) => { clearTimeout(timer); done(error); };
+            try {
+                const result = GM_cookie.set(details, finish);
+                if (result && typeof result.then === 'function') {
+                    result.then(() => finish(null), finish);
+                }
+            } catch (e) {
+                finish(e);
+            }
+        });
+    }
+
+    // Install the SID from the background login into the browser's cookie jar.
+    // Resolves true only once the session actually works from this page.
+    async function plantSessionCookie(sid, responseHeaders) {
+        if (!sid || sid === 'safari-auto' || sid === 'no-sid-cookie') return false;
+        if (!silentSignInAvailable()) return false;
+
+        const attrs = parseSidAttributes(responseHeaders);
+        const details = {
+            url: `${qbitBaseUrl()}/`,
+            name: 'SID',
+            value: sid,
+            path: attrs.path,
+            httpOnly: attrs.httpOnly,
+            secure: attrs.secure,
+        };
+        if (attrs.sameSite) details.sameSite = attrs.sameSite;
+
+        if (!await gmCookieSet(details)) {
+            // The API itself is unusable here - stop paying for it every sign-in
+            setCookieApiBroken(true);
+            debugLog('qBittorrent: cookie API refused the write, falling back to the Web UI tab');
+            return false;
+        }
+
+        const ok = await probeSession();
+        debugLog('qBittorrent: planted SID cookie ->', ok ? 'session usable' : 'still not usable');
+        return ok;
+    }
+
     // Is this page the qBittorrent Web UI opened by autoLoginViaTab()?
-    function getAutoLoginNonce() {
+    // Returns { nonce, background } or null.
+    function getAutoLoginMarker() {
         const m = location.hash.match(AUTOLOGIN_HASH_RE);
         if (!m) return null;
         if (location.origin !== getOriginFromUrl(CONFIG.qbittorrent.url)) return null;
-        return m[1];
+        return { nonce: m[1], background: !!m[2] };
     }
 
     // Runs on the qBittorrent Web UI page: log in same-origin, report back, close.
-    function runAutoLoginPage(nonce) {
+    function runAutoLoginPage(nonce, background = false) {
         const base = qbitBaseUrl();
 
         const report = (ok, reason = '') => {
@@ -641,10 +739,11 @@
             report(ok, reason);
 
             if (ok) {
-                // Close the tab if we were opened by the script; otherwise just
-                // show the (now signed-in) Web UI without the marker.
-                window.close();
-                setTimeout(() => location.replace(`${base}/`), 500);
+                // A background tab wasn't opened by script, so window.close()
+                // does nothing here — the tab that asked for the sign-in closes
+                // us instead. Only tidy up ourselves if that never happens.
+                if (!background) window.close();
+                setTimeout(() => location.replace(`${base}/`), background ? 15000 : 500);
             } else {
                 // Leave the login page up so the user can sign in by hand;
                 // strip the marker so a reload doesn't retry.
@@ -699,9 +798,17 @@
 
     // Call synchronously from a click/tap handler (before any await).
     // Resolves true when it's fine to proceed with the add.
+    //
+    // Only worth doing when the sign-in has to go through window.open, which
+    // is the one path that needs a live user gesture. If the session can be
+    // repaired silently, or a tab can be opened in the background, the normal
+    // async path handles it without hijacking the tap.
     function signInFromGestureIfNeeded() {
         const stale = safariProbeOk === false && (Date.now() - safariProbeAt) < PREWARM_FRESH_MS;
         if (!isSafari || shouldUseFetch() || !safariNeedsTabLogin || !stale) {
+            return Promise.resolve(true);
+        }
+        if (silentSignInAvailable() || hasOpenInTab()) {
             return Promise.resolve(true);
         }
         safariProbeOk = null;
@@ -720,29 +827,62 @@
         return autoLoginInFlight;
     }
 
+    const hasOpenInTab = () => typeof GM_openInTab === 'function';
+
+    // Open the sign-in page, preferring a background tab. GM_openInTab is an
+    // extension API, so it is not blocked as a pop-up and does not need a live
+    // user gesture; window.open (the fallback) always pulls focus away from
+    // whatever the user was doing. Returns a handle, or null if nothing opened.
+    function openSignInTab(nonce) {
+        const base = `${qbitBaseUrl()}/#qbit-autologin=${nonce}`;
+
+        if (hasOpenInTab()) {
+            try {
+                const tab = GM_openInTab(`${base}&bg`, { active: false, insert: true, setParent: true });
+                if (tab) {
+                    return {
+                        background: true,
+                        isClosed: () => !!tab.closed,
+                        close: () => { try { tab.close(); } catch (e) { /* already gone */ } },
+                    };
+                }
+            } catch (e) {
+                debugLog('qBittorrent: GM_openInTab unavailable:', e);
+            }
+        }
+
+        try {
+            const win = window.open(base, '_blank');
+            if (win) {
+                return {
+                    background: false,
+                    isClosed: () => !!win.closed,
+                    close: () => { try { win.close(); } catch (e) { /* already gone */ } },
+                };
+            }
+        } catch (e) { /* pop-up blocked */ }
+
+        return null;
+    }
+
     async function doAutoLoginViaTab() {
         const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
-        const loginUrl = `${qbitBaseUrl()}/#qbit-autologin=${nonce}`;
         try { GM_setValue('qbit_autologin_result', null); } catch (e) { /* ignore */ }
 
-        const openTab = () => {
-            try { return window.open(loginUrl, '_blank'); } catch (e) { return null; }
-        };
-
-        let win = openTab();
-        if (!win) {
+        let handle = openSignInTab(nonce);
+        if (!handle) {
             // Pop-up blocked (we're past the click's user gesture) — ask for a tap
             const tapped = await new Promise((resolve) => {
                 showModal(
                     '🔑 Sign in to qBittorrent',
                     `<p>Safari needs a cookie session for qBittorrent. Tap below to open qBittorrent in a new tab — the script will sign in automatically and come back here.</p>`,
-                    () => { win = openTab(); resolve(true); },
+                    () => { handle = openSignInTab(nonce); resolve(true); },
                     () => resolve(false),
                     { confirmLabel: 'Open qBittorrent' }
                 );
             });
             if (!tapped) return false;
-            if (!win) {
+            if (!handle) {
                 showToast('Safari blocked the qBittorrent tab. Allow pop-ups for this site and try again.', 'error');
                 return false;
             }
@@ -752,17 +892,23 @@
         qbitSessionId = 'safari-auto';
         GM_setValue('qbit_session', null);
 
-        return waitForTabLogin(win, nonce);
+        return waitForTabLogin(handle, nonce);
     }
 
     // Wait until the qBittorrent session is usable from this tab. Listens for
     // the sign-in tab's signal (postMessage / GM storage / tab closed) and also
     // polls the API directly, so it works even if none of the signals arrive.
-    function waitForTabLogin(win, nonce) {
+    //
+    // A background tab is invisible, so nothing is put on screen while it does
+    // its work — the blocking modal only appears if it fails or stalls.
+    const BACKGROUND_ESCALATE_MS = 10000;
+
+    function waitForTabLogin(handle, nonce) {
         return new Promise((resolve) => {
             let done = false;
             let probing = false;
             let modal = null;
+            const background = !!(handle && handle.background);
             const startedAt = Date.now();
 
             const waitingHtml = `
@@ -771,6 +917,9 @@
             const failedHtml = `
                 <p>Automatic sign-in failed in the qBittorrent tab (check the username and password in settings).</p>
                 <p style="color: #888; font-size: 12px;">You can log in manually in that tab, then come back here and tap Retry.</p>`;
+            const stalledHtml = `
+                <p>Signing in to qBittorrent in a background tab. This is taking longer than usual.</p>
+                <p style="color: #888; font-size: 12px;">Switch to the qBittorrent tab to let it finish, then come back here and tap Retry.</p>`;
 
             const openModal = (html) => {
                 if (modal) modal.close();
@@ -789,9 +938,11 @@
                 clearInterval(timer);
                 window.removeEventListener('message', onMessage);
                 if (modal) { modal.close(); modal = null; }
+                // A background tab has no opener of its own to close it
+                if (ok && background && handle && !handle.isClosed()) handle.close();
                 if (ok) {
                     debugLog('qBittorrent: Session established via Web UI tab');
-                    showToast('qBittorrent session ready', 'success');
+                    if (!background) showToast('qBittorrent session ready', 'success');
                 } else {
                     showToast('Could not establish a qBittorrent session', 'error');
                 }
@@ -814,7 +965,7 @@
 
             const onSignal = (ok) => {
                 if (ok) check();
-                else if (modal) openModal(failedHtml);
+                else openModal(failedHtml); // sign-in failed: the user has to step in
             };
 
             const onMessage = (e) => {
@@ -837,13 +988,22 @@
                     }
                 }
                 // Tab closed itself (success path) or user closed it — check now
-                if (win && win.closed) check();
+                if (handle && handle.isClosed()) check();
                 // Fallback: poll the API every 2s regardless of signals
                 if (ticks % 4 === 0) check();
+                // A background tab that hasn't reported back may be suspended,
+                // or the user may need to look at it — surface it at that point
+                if (background && !modal && Date.now() - startedAt > BACKGROUND_ESCALATE_MS) {
+                    openModal(stalledHtml);
+                }
                 if (Date.now() - startedAt > AUTOLOGIN_TIMEOUT_MS) finish(false);
             }, 500);
 
-            openModal(waitingHtml);
+            if (background) {
+                debugLog('qBittorrent: signing in from a background tab');
+            } else {
+                openModal(waitingHtml);
+            }
         });
     }
 
@@ -967,6 +1127,8 @@
     let loginPromise = null;
     // Why the last login failed: 'credentials' | 'denied' | 'network' | null
     let lastLoginError = null;
+    // Response headers from the last successful login (source of the SID attributes)
+    let lastLoginHeaders = '';
 
     function qbitLogin() {
         if (loginPromise) return loginPromise;
@@ -994,6 +1156,7 @@
                 // When using GM_xmlhttpRequest, extract SID from response headers
                 if (!shouldUseFetch()) {
                     const cookies = response.responseHeaders;
+                    lastLoginHeaders = cookies || '';
                     debugLog('qBittorrent: Login response headers:', cookies);
                     const sidMatch = cookies.match(/SID=([^;]+)/i);
                     if (sidMatch) {
@@ -1105,12 +1268,19 @@
         if (!loggedIn && lastLoginError === 'credentials') {
             return false; // the Web UI tab would fail the same way
         }
+
+        // The login worked but its Set-Cookie never reached Safari's jar
+        // (typical on iOS/iPadOS). If the cookie API is available we can put
+        // the SID there ourselves, which keeps the sign-in completely silent.
+        if (loggedIn && await plantSessionCookie(qbitSessionId, lastLoginHeaders)) {
+            setSafariNeedsTabLogin(false);
+            return true;
+        }
+
         if (loggedIn || lastLoginError === 'denied') {
             setSafariNeedsTabLogin(true);
         }
 
-        // Login didn't produce a usable session (typical on iOS/iPadOS: the
-        // background request's Set-Cookie never reaches Safari's jar)
         debugLog('qBittorrent: Session not usable after login, signing in via Web UI tab');
         return await autoLoginViaTab();
     }
@@ -1683,10 +1853,10 @@
     function init() {
         // If this is the qBittorrent Web UI opened by autoLoginViaTab(),
         // sign in same-origin and hand the session back — nothing else to do here
-        const autoLoginNonce = getAutoLoginNonce();
-        if (autoLoginNonce) {
+        const autoLoginMarker = getAutoLoginMarker();
+        if (autoLoginMarker) {
             debugLog('qBittorrent: Web UI auto sign-in page detected');
-            runAutoLoginPage(autoLoginNonce);
+            runAutoLoginPage(autoLoginMarker.nonce, autoLoginMarker.background);
             return;
         }
 
