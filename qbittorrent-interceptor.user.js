@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.13.0
+// @version      1.14.0
 // @description  Intercept torrent downloads and magnet links, send them to qBittorrent, follow TV shows with qbt-dl, or download locally
 // @author       joshkerr
 // @match        *://*/*
@@ -445,14 +445,18 @@
                 <label>Daemon URL:
                     <input type="text" id="qbit-cfg-daemon-url" value="${escapeHtml(CONFIG.daemon.url)}" placeholder="http://mediaserver:8791">
                 </label>
-                <label>Daemon token:
-                    <input type="password" id="qbit-cfg-daemon-token" value="${escapeHtml(CONFIG.daemon.token)}" autocomplete="off">
-                </label>
+                <p class="qbit-status">Connect using the qBittorrent username and password above. They must match the account configured on your daemon.</p>
+                <details>
+                    <summary>Advanced: daemon token</summary>
+                    <label>Daemon token (filled automatically after connecting):
+                        <input type="password" id="qbit-cfg-daemon-token" value="${escapeHtml(CONFIG.daemon.token)}" autocomplete="off">
+                    </label>
+                </details>
                 <label>Default destination on daemon:
                     <select id="qbit-cfg-daemon-destination"></select>
                 </label>
-                <button class="qbit-action-btn" id="qbit-act-daemon-test">Test daemon &amp; load destinations</button>
-                <p class="qbit-status" id="qbit-daemon-status" role="status">Use the URL and token printed by qbt-dl daemon. Configure its catalog, sources and destinations first.</p>
+                <button class="qbit-action-btn" id="qbit-act-daemon-test">Connect</button>
+                <p class="qbit-status" id="qbit-daemon-status" role="status">Enter your daemon URL and click Connect. No key or access to the server screen is needed.</p>
                 <hr class="qbit-actions-divider">
                 <div class="qbit-actions-header">Quick Actions</div>
                 <div class="qbit-actions-grid">
@@ -481,33 +485,77 @@
         document.body.appendChild(overlay);
 
         const daemonDestination = modal.querySelector('#qbit-cfg-daemon-destination');
+        const daemonURL = modal.querySelector('#qbit-cfg-daemon-url');
+        const daemonToken = modal.querySelector('#qbit-cfg-daemon-token');
+        const daemonStatus = modal.querySelector('#qbit-daemon-status');
+        const saveButton = modal.querySelector('#qbit-cfg-save');
         daemonDestination.add(new Option(CONFIG.daemon.destination || 'Choose when following', CONFIG.daemon.destination));
+        let tokenConnection = CONFIG.daemon.url.trim();
         let destinationConnection = JSON.stringify([CONFIG.daemon.url, CONFIG.daemon.token]);
         const daemonSettings = () => ({
-            url: modal.querySelector('#qbit-cfg-daemon-url').value.trim(),
-            token: modal.querySelector('#qbit-cfg-daemon-token').value.trim(),
+            url: daemonURL.value.trim(),
+            // Never send the previous server's token to a newly entered URL.
+            token: tokenConnection === daemonURL.value.trim() ? daemonToken.value.trim() : '',
         });
+        const loginCredentials = () => ({
+            username: modal.querySelector('#qbit-cfg-username').value,
+            password: modal.querySelector('#qbit-cfg-password').value,
+        });
+        daemonURL.oninput = () => {
+            daemonToken.value = '';
+            tokenConnection = '';
+            destinationConnection = '';
+            daemonDestination.replaceChildren(new Option('Choose when following', ''));
+            daemonStatus.textContent = 'Click Connect to sign in to this daemon.';
+        };
+        daemonToken.oninput = () => { tokenConnection = daemonURL.value.trim(); };
         modal.querySelector('#qbit-act-daemon-test').onclick = async (event) => {
             const button = event.currentTarget;
-            const status = modal.querySelector('#qbit-daemon-status');
             button.disabled = true;
-            status.textContent = 'Connecting…';
-            const settings = daemonSettings();
+            saveButton.disabled = true;
+            daemonStatus.textContent = 'Connecting…';
+            const initialSettings = daemonSettings();
+            const credentials = loginCredentials();
+            const settings = { ...initialSettings };
+            const unchanged = () => JSON.stringify(daemonSettings()) === JSON.stringify(initialSettings) &&
+                JSON.stringify(loginCredentials()) === JSON.stringify(credentials);
             try {
-                const state = await loadDaemonState(settings);
-                if (JSON.stringify(daemonSettings()) !== JSON.stringify(settings)) {
-                    status.textContent = 'Settings changed. Test the connection again.';
+                let state;
+                if (settings.token) {
+                    try { state = await loadDaemonState(settings); }
+                    catch (error) {
+                        if (error.status !== 401) throw error;
+                        settings.token = '';
+                    }
+                }
+                if (!modal.isConnected) return;
+                if (!unchanged()) {
+                    daemonStatus.textContent = 'Settings changed. Click Connect again.';
                     return;
                 }
+                if (!settings.token) {
+                    daemonStatus.textContent = 'Signing in with your qBittorrent account…';
+                    settings.token = await loginToDaemon(settings, credentials);
+                    state = await loadDaemonState(settings);
+                }
+                if (!modal.isConnected) return;
+                if (!unchanged()) {
+                    daemonStatus.textContent = 'Settings changed. Click Connect again.';
+                    return;
+                }
+                daemonToken.value = settings.token;
+                tokenConnection = settings.url;
+                modal.querySelector('#qbit-cfg-daemon-enabled').checked = true;
                 daemonDestination.replaceChildren(new Option('Choose when following', ''));
                 state.destinations.forEach(path => daemonDestination.add(new Option(path, path)));
                 if (state.destinations.includes(CONFIG.daemon.destination)) daemonDestination.value = CONFIG.daemon.destination;
                 destinationConnection = JSON.stringify([settings.url, settings.token]);
-                status.textContent = `Connected. ${state.destinations.length} destination(s). ${daemonReadiness(state)}`;
+                daemonStatus.textContent = `Connected. ${state.destinations.length} destination(s). Save Settings to remember this connection. ${daemonReadiness(state)}`;
             } catch (error) {
-                status.textContent = error.message;
+                daemonStatus.textContent = error.message;
             } finally {
                 button.disabled = false;
+                saveButton.disabled = false;
             }
         };
 
@@ -616,21 +664,36 @@
     // QBT-DL DAEMON / TV SUBSCRIPTIONS
     // ============================================
 
-    function validateDaemonSettings(settings) {
+    function validateDaemonSettings(settings, requireToken = true) {
         let url;
         try { url = new URL(settings.url); } catch (_) { /* handled below */ }
         if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
             throw new Error('Enter an HTTP(S) daemon URL without credentials, query or fragment.');
         }
-        if (!settings.token.trim() || /[\r\n]/.test(settings.token)) {
-            throw new Error('Enter the bearer token printed by qbt-dl daemon.');
+        if (requireToken && (typeof settings.token !== 'string' || !settings.token.trim() || /[\r\n]/.test(settings.token))) {
+            throw new Error('Click Connect to sign in with your qBittorrent account, or enter a daemon token under Advanced.');
         }
         return url.href.replace(/\/+$/, '');
     }
 
     function daemonRequest(command, settings) {
+        return daemonJSONRequest('/api/v1/library', command, settings);
+    }
+
+    async function loginToDaemon(settings, credentials) {
+        if (!credentials.username.trim() || !credentials.password) {
+            throw new Error('Enter your qBittorrent username and password above, then click Connect.');
+        }
+        const result = await daemonJSONRequest('/api/v1/auth/login', credentials, settings, false);
+        if (typeof result.token !== 'string' || !result.token.trim() || /[\r\n]/.test(result.token)) {
+            throw new Error('The daemon did not return a valid login token. Update and restart qbt-dl.');
+        }
+        return result.token;
+    }
+
+    function daemonJSONRequest(endpoint, data, settings, requireToken = true) {
         return new Promise((resolve, reject) => {
-            const base = validateDaemonSettings(settings);
+            const base = validateDaemonSettings(settings, requireToken);
             // Always use the userscript transport: no page CORS changes or qBittorrent cookies.
             // Explicit timeout also covers managers whose fetch transport ignores timeout.
             let request;
@@ -638,27 +701,35 @@
                 reject(new Error('qbt-dl request timed out. Check the daemon URL and network.'));
                 if (request && request.abort) request.abort();
             }, REQUEST_TIMEOUT_MS);
-            const fail = message => { clearTimeout(timer); reject(new Error(message)); };
+            const fail = (message, status) => {
+                clearTimeout(timer);
+                const error = new Error(message);
+                error.status = status;
+                reject(error);
+            };
             try {
                 request = GM_xmlhttpRequest({
-                    method: command ? 'POST' : 'GET',
-                    url: `${base}/api/v1/library`,
-                    headers: { Authorization: `Bearer ${settings.token.trim()}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-                    data: command ? JSON.stringify(command) : undefined,
+                    method: data ? 'POST' : 'GET',
+                    url: `${base}${endpoint}`,
+                    headers: { ...(requireToken ? { Authorization: `Bearer ${settings.token.trim()}` } : {}), 'Content-Type': 'application/json', Accept: 'application/json' },
+                    data: data ? JSON.stringify(data) : undefined,
                     anonymous: true,
                     redirect: 'error',
                     timeout: REQUEST_TIMEOUT_MS,
                     onload: response => {
                         clearTimeout(timer);
                         if (response.status === 401 || response.status === 403) {
-                            return fail('qbt-dl rejected the token. Check the daemon settings.');
+                            return fail(requireToken ? 'qbt-dl rejected the token. Open settings and click Connect again.' : 'qBittorrent username or password does not match the account configured on this daemon.', response.status);
                         }
-                        if (response.status === 404) return fail('Library API not found. Use qbt-dl 3.4.0 or newer and its daemon base URL.');
+                        if (response.status === 404 || response.status === 405) {
+                            return fail(requireToken ? 'Library API not found. Use qbt-dl 3.4.0 or newer and its daemon base URL.' : 'This daemon does not support qBittorrent login yet. Update and restart qbt-dl, or enter its token under Advanced.', response.status);
+                        }
+                        if (response.status === 429) return fail('Too many login attempts. Wait a minute, then click Connect again.', response.status);
                         let result;
                         try { result = JSON.parse(response.responseText); }
                         catch (_) { return fail('qbt-dl returned an invalid response. Check the URL and reverse proxy.'); }
                         if (response.status < 200 || response.status >= 300) {
-                            return fail(typeof result?.error === 'string' ? result.error : `qbt-dl returned HTTP ${response.status}.`);
+                            return fail(typeof result?.error === 'string' ? result.error : `qbt-dl returned HTTP ${response.status}.`, response.status);
                         }
                         if (!result || typeof result !== 'object' || Array.isArray(result)) return fail('Invalid qbt-dl API response.');
                         resolve(result);

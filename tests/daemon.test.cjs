@@ -31,14 +31,14 @@ function setup(t, { state = initialState, handler, storage = {}, addOK = true } 
             const result = handler?.(command, options);
             if (result === 'pending') return;
             if (result?.event) return options[result.event]();
-            const body = result?.body ?? (command?.action === 'discover' ? { titles: [title] } : command ? { message: 'Subscription saved' } : { state });
+            const body = result?.body ?? (options.url.endsWith('/auth/login') ? { token: 'login-token' } : command?.action === 'discover' ? { titles: [title] } : command ? { message: 'Subscription saved' } : { state });
             options.onload({ status: result?.status || 200, responseText: typeof body === 'string' ? body : JSON.stringify(body) });
         });
         return { abort() {} };
     };
     w.__add = async (...args) => { adds.push(args); return addOK; };
     w.eval(source.replace('    init();\n})();', `
-        globalThis.__test = { parseShowHint, validateDaemonSettings, daemonRequest, showFollowModal, showConfigModal,
+        globalThis.__test = { parseShowHint, validateDaemonSettings, daemonRequest, loginToDaemon, showFollowModal, showConfigModal,
             handleLink, setupMagnetProtocolInterceptor, handleTorrentDownload,
             stubAdds() { signInFromGestureIfNeeded = async () => true; addTorrentByUrl = globalThis.__add; addTorrentByFile = globalThis.__add; },
             stubBlob(blob) { downloadTorrentFile = async () => blob; }
@@ -78,7 +78,7 @@ test('daemon uses bearer auth through GM, preserves base paths, rejects unsafe s
     for (const url of ['javascript:alert(1)', 'file:///tmp', 'https://user:pass@host', 'https://host/?q=x', 'https://host/#x', 'broken']) {
         await assert.rejects(api.daemonRequest(null, { url, token: 'secret' }), /HTTP\(S\)/);
     }
-    await assert.rejects(api.daemonRequest(null, { url: 'https://host', token: '' }), /bearer token/);
+    await assert.rejects(api.daemonRequest(null, { url: 'https://host', token: '' }), /Click Connect/);
 });
 
 for (const [label, response, pattern] of [
@@ -238,6 +238,7 @@ test('settings test unsaved connection, load destinations, and save credentials'
     ctx.api.showConfigModal();
     ctx.find('#qbit-cfg-daemon-url').value = 'https://new-daemon/base';
     ctx.find('#qbit-cfg-daemon-token').value = 'new-token';
+    ctx.find('#qbit-cfg-daemon-token').dispatchEvent(new ctx.w.Event('input'));
     ctx.find('#qbit-act-daemon-test').click();
     await tick();
     assert.equal(ctx.requests[0].url, 'https://new-daemon/base/api/v1/library');
@@ -271,4 +272,130 @@ test('disabled integration leaves normal add unchanged; menu opens setup', t => 
     ctx.menus.get('📺 Follow TV show with qbt-dl')();
     assert.ok(ctx.find('#qbit-cfg-daemon-url'));
     assert.equal(ctx.requests.length, 0);
+});
+
+test('Connect uses the entered qBittorrent credentials and remembers the returned token on Save', async t => {
+    const ctx = setup(t, { storage: { qbit_daemon_token: '', qbit_daemon_enabled: false } });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-cfg-username').value = 'seedbox-user';
+    ctx.find('#qbit-cfg-password').value = 'my existing password';
+    ctx.find('#qbit-act-daemon-test').click();
+    assert.equal(ctx.find('#qbit-cfg-save').disabled, true);
+    await tick();
+    const login = ctx.requests[0];
+    assert.equal(login.url, 'http://daemon:8791/api/v1/auth/login');
+    assert.deepEqual(JSON.parse(login.data), { username: 'seedbox-user', password: 'my existing password' });
+    assert.equal(login.headers.Authorization, undefined);
+    assert.equal(login.anonymous, true);
+    assert.equal(login.redirect, 'error');
+    assert.equal(ctx.requests[1].headers.Authorization, 'Bearer login-token');
+    assert.equal(ctx.find('#qbit-cfg-daemon-enabled').checked, true);
+    assert.equal(ctx.saved.get('qbit_daemon_token'), '');
+    assert.match(ctx.find('#qbit-daemon-status').textContent, /Connected/);
+    ctx.find('#qbit-cfg-save').click();
+    assert.equal(ctx.saved.get('qbit_daemon_token'), 'login-token');
+    assert.equal(ctx.saved.get('qbit_password'), 'my existing password');
+    // Normal requests now use the stored token, not the account password.
+    ctx.api.showFollowModal('Example S01E05');
+    await tick();
+    assert.equal(ctx.requests.filter(r => r.url.endsWith('/auth/login')).length, 1);
+    assert.equal(ctx.requests.at(-1).headers.Authorization, 'Bearer login-token');
+});
+
+test('Connect reuses a saved token without sending qBittorrent credentials', async t => {
+    const ctx = setup(t);
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    assert.equal(ctx.requests.length, 1);
+    assert.equal(ctx.requests[0].data, undefined);
+    assert.equal(ctx.requests[0].headers.Authorization, 'Bearer secret');
+});
+
+test('Connect renews a rejected token once using qBittorrent login', async t => {
+    const ctx = setup(t, { handler(command, request) {
+        if (request.headers.Authorization === 'Bearer secret') return { status: 401 };
+    } });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    assert.equal(ctx.requests.length, 3);
+    assert.equal(ctx.requests[1].url, 'http://daemon:8791/api/v1/auth/login');
+    assert.equal(ctx.find('#qbit-cfg-daemon-token').value, 'login-token');
+});
+
+test('changing daemon URL never sends the previous server token', async t => {
+    const ctx = setup(t);
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-cfg-daemon-url').value = 'https://other-daemon/base';
+    ctx.find('#qbit-cfg-daemon-url').dispatchEvent(new ctx.w.Event('input'));
+    assert.equal(ctx.find('#qbit-cfg-daemon-token').value, '');
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    assert.equal(ctx.requests[0].url, 'https://other-daemon/base/api/v1/auth/login');
+    assert.equal(ctx.requests[0].headers.Authorization, undefined);
+    assert.equal(ctx.requests.some(r => r.headers.Authorization === 'Bearer secret'), false);
+});
+
+for (const [label, response, pattern] of [
+    ['wrong credentials', { status: 401 }, /does not match/],
+    ['old daemon', { status: 404 }, /Update and restart/],
+    ['rate limited', { status: 429 }, /Wait a minute/],
+    ['missing server credentials', { status: 503, body: { error: 'configure a qBittorrent username and password on the daemon' } }, /configure a qBittorrent/],
+    ['missing returned token', { body: {} }, /valid login token/],
+    ['malformed returned token', { body: { token: 'bad\ntoken' } }, /valid login token/],
+]) test(`failed login: ${label}`, async t => {
+    const ctx = setup(t, { storage: { qbit_daemon_token: '' }, handler: () => response });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    assert.match(ctx.find('#qbit-daemon-status').textContent, pattern);
+    assert.equal(ctx.saved.get('qbit_daemon_token'), '');
+    assert.equal(ctx.requests.length, 1);
+    assert.equal(ctx.find('#qbit-cfg-save').disabled, false);
+});
+
+test('blank client credentials block login before any request', async t => {
+    const ctx = setup(t);
+    await assert.rejects(ctx.api.loginToDaemon({ url: 'http://daemon' }, { username: '', password: '' }), /Enter your qBittorrent/);
+    assert.equal(ctx.requests.length, 0);
+});
+
+test('changed connection settings discard an in-flight login result', async t => {
+    let pending;
+    const ctx = setup(t, { storage: { qbit_daemon_token: '' }, handler(command, request) {
+        if (request.url.endsWith('/auth/login')) { pending = request; return 'pending'; }
+    } });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    ctx.find('#qbit-cfg-daemon-url').value = 'http://different-daemon';
+    ctx.find('#qbit-cfg-daemon-url').dispatchEvent(new ctx.w.Event('input'));
+    pending.onload({ status: 200, responseText: JSON.stringify({ token: 'old-server-token' }) });
+    await tick();
+    assert.equal(ctx.find('#qbit-cfg-daemon-token').value, '');
+    assert.match(ctx.find('#qbit-daemon-status').textContent, /Settings changed/);
+    assert.equal(ctx.saved.get('qbit_daemon_token'), '');
+});
+
+test('closing settings during a token check does not subsequently send credentials', async t => {
+    let pending;
+    const ctx = setup(t, { handler(command, request) { pending = request; return 'pending'; } });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    ctx.find('#qbit-cfg-cancel').click();
+    pending.onload({ status: 401, responseText: '{}' });
+    await tick();
+    assert.equal(ctx.requests.length, 1);
+    assert.equal(ctx.saved.get('qbit_daemon_token'), 'secret');
+});
+
+test('proxy errors do not trigger a password login', async t => {
+    const ctx = setup(t, { handler: () => ({ status: 403 }) });
+    ctx.api.showConfigModal();
+    ctx.find('#qbit-act-daemon-test').click();
+    await tick();
+    assert.equal(ctx.requests.length, 1);
+    assert.equal(ctx.requests[0].data, undefined);
 });

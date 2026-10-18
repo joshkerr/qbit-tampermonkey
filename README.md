@@ -61,13 +61,19 @@ Requires **qbt-dl 3.4.0 or newer**. On the machine that should receive your TV f
 1. Configure qbt-dl's qBittorrent connection and rclone remote for your seedbox.
 2. Add at least one absolute destination path with `qbt-dl destinations add`.
 3. Configure a TMDB API key/read token and an enabled RSS or Torznab source in qbt-dl's **Sources** view, selecting the daemon machine. These settings belong to the daemon, not the browser. The clicked webpage is not automatically turned into a source.
-4. Run `qbt-dl daemon` and copy its URL and bearer token from the startup output.
+4. Update/rebuild and restart `qbt-dl daemon` with support for qBittorrent login. You only need its reachable base URL; no server-screen access or pairing code is needed.
 
 In **Configure qBittorrent → qbt-dl TV subscriptions**:
 
-1. Enable **Offer to follow TV shows**.
-2. Enter the daemon's base URL (for example `http://mediaserver:8791`) and token. Use an address reachable from the browser's device; on an iPhone, `localhost` means the iPhone. A reverse-proxy base path is supported; enter the final URL without redirects or `/api/v1`.
-3. Click **Test daemon & load destinations**, optionally select a default destination, and save. The test uses the fields currently in the dialog and verifies authenticated library access.
+1. Keep your qBittorrent username and password in the usual fields at the top of the settings dialog.
+2. Enter the daemon's base URL (for example `http://mediaserver:8791`). Use an address reachable from the browser's device; on an iPhone, `localhost` means the iPhone. A reverse-proxy base path is supported; enter the final URL without redirects or `/api/v1`.
+3. Click **Connect**. The script uses the username and password currently in the dialog to sign in, automatically fills its daemon token, enables following, and loads destinations. Optionally select a default destination, then click **Save Settings**. Future requests reuse the saved token.
+
+The credentials must exactly match the daemon's configured `qbt_username` / `qbt_password` (or its `QBT_USERNAME` / `QBT_PASSWORD` environment overrides). The daemon checks them locally, so seedbox downtime or IP-based qBittorrent login bypass does not change who can access the daemon. This login grants the same access as its existing bearer token.
+
+A working saved token is reused without sending your password again. If it has been rotated, open settings and click **Connect** to sign in again. Changing the daemon URL clears the old token and destination. Failed login attempts are throttled; wait a minute before retrying if requested.
+
+**Advanced: daemon token** remains available for older daemons and installations without configured qBittorrent credentials. If Connect reports that login is unsupported, update and restart qbt-dl or use this fallback. Version 1.14.0 adds password login to the userscript; subscription support itself still requires qbt-dl 3.4.0+.
 
 When adding a torrent, choose **Add & follow TV show…**. The script uses the magnet name, torrent filename, link text/title, or page title as a search hint. Edit the search if needed, then explicitly choose the matching catalog show and its destination on the daemon. Choose an episode scope:
 
@@ -83,7 +89,7 @@ Following uses the daemon's configured sources to find releases and transfer the
 
 For a show already downloading, or when add confirmation is disabled, use **Follow TV show with qbt-dl** in the Tampermonkey menu. This follows a show without submitting another torrent. Selecting a show already followed loads its existing scope and destination; saving updates and enables it while preserving its original follow date. Manage/pause subscriptions in the qbt-dl GUI's Following view for that daemon.
 
-Daemon calls always use `GM_xmlhttpRequest` with bearer authentication and no cookies, independently of the qBittorrent Fetch Mode setting. Allow the daemon host when Tampermonkey requests permission. There is no need to enable browser CORS on the daemon. The [Tampermonkey request documentation](https://www.tampermonkey.net/documentation.php#api:GM_xmlhttpRequest) describes this transport. The bearer token is stored locally in Tampermonkey, just like the existing qBittorrent credentials; use HTTPS or a trusted private network.
+Daemon calls always use `GM_xmlhttpRequest` with no cookies. The initial login exchanges credentials for a token; subsequent calls use bearer authentication, independently of the qBittorrent Fetch Mode setting. Allow the daemon host when Tampermonkey requests permission. There is no need to enable browser CORS on the daemon. The [Tampermonkey request documentation](https://www.tampermonkey.net/documentation.php#api:GM_xmlhttpRequest) describes this transport. The bearer token is stored locally in Tampermonkey, just like the existing qBittorrent credentials; use HTTPS or a trusted private network.
 
 ### Remote qBittorrent Server
 
@@ -201,7 +207,7 @@ npm run check
 npm test
 ```
 
-Tests run the userscript dialogs in jsdom with mocked Tampermonkey and daemon APIs. They cover authentication errors, all monitoring scopes, existing subscriptions, failed additions, follow retries, settings, search races, and untrusted titles without contacting a real server.
+Tests run the userscript dialogs in jsdom with mocked Tampermonkey and daemon APIs. They cover credential login, token reuse/renewal, changed-server isolation, authentication errors, all monitoring scopes, existing subscriptions, failed additions, follow retries, settings, search races, and untrusted titles without contacting a real server.
 
 ## License
 
