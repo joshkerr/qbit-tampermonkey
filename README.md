@@ -11,6 +11,7 @@ A Tampermonkey userscript that intercepts torrent file downloads and magnet link
 - **Confirmation Dialogs** - Optional confirmation before adding torrents
 - **Toast Notifications** - Visual feedback when torrents are added
 - **Configurable Settings** - Set your qBittorrent URL, credentials, save path, and category
+- **Follow TV Shows** - Connect to a qbt-dl daemon and monitor future episodes, all missing episodes, or episodes from a chosen season/episode
 - **Dark Mode Support** - UI adapts to your system theme
 - **Safari Compatible** - Works with Safari on macOS, iOS, and iPadOS via Tampermonkey (on iOS/iPadOS the script signs in to qBittorrent for you in the background — no need to log in manually first)
 
@@ -53,6 +54,37 @@ After installation, configure your qBittorrent connection:
    - **Save Path** (optional): Default download location
    - **Category** (optional): Auto-assign category to added torrents
 
+### Optional: follow TV shows with qbt-dl
+
+Requires **qbt-dl 3.4.0 or newer**. On the machine that should receive your TV files:
+
+1. Configure qbt-dl's qBittorrent connection and rclone remote for your seedbox.
+2. Add at least one absolute destination path with `qbt-dl destinations add`.
+3. Configure a TMDB API key/read token and an enabled RSS or Torznab source in qbt-dl's **Sources** view, selecting the daemon machine. These settings belong to the daemon, not the browser. The clicked webpage is not automatically turned into a source.
+4. Run `qbt-dl daemon` and copy its URL and bearer token from the startup output.
+
+In **Configure qBittorrent → qbt-dl TV subscriptions**:
+
+1. Enable **Offer to follow TV shows**.
+2. Enter the daemon's base URL (for example `http://mediaserver:8791`) and token. Use an address reachable from the browser's device; on an iPhone, `localhost` means the iPhone. A reverse-proxy base path is supported; enter the final URL without redirects or `/api/v1`.
+3. Click **Test daemon & load destinations**, optionally select a default destination, and save. The test uses the fields currently in the dialog and verifies authenticated library access.
+
+When adding a torrent, choose **Add & follow TV show…**. The script uses the magnet name, torrent filename, link text/title, or page title as a search hint. Edit the search if needed, then explicitly choose the matching catalog show and its destination on the daemon. Choose an episode scope:
+
+| Choice | Behavior |
+| --- | --- |
+| Future episodes only | Episodes airing on or after the subscription's UTC calendar date; it does not mean “after the clicked episode.” |
+| All episodes | Backfill missing aired episodes across seasons and continue following future episodes. Existing files and the daemon's quality rules still apply. |
+| From a specific episode | Include the starting season/episode and later episodes/seasons. The inputs are prefilled from names like `S01E05` or `1x05`. |
+
+**Add & follow** adds the clicked torrent to qBittorrent using your normal settings, then saves the subscription. If adding fails, no subscription is created. If the follow request fails after adding, the dialog offers **Retry follow** without adding the torrent again. A timed-out subscription can be retried safely because the daemon updates an existing catalog title rather than creating a duplicate.
+
+Following uses the daemon's configured sources to find releases and transfer them to its own destination. It **does not automatically import the clicked torrent** into the daemon library or guarantee that a tracker has every episode. See the [qbt-dl library documentation](https://github.com/joshkerr/qbt-dl#tv-and-movie-subscriptions) for source setup, quality rules, scheduling and monitoring.
+
+For a show already downloading, or when add confirmation is disabled, use **Follow TV show with qbt-dl** in the Tampermonkey menu. This follows a show without submitting another torrent. Selecting a show already followed loads its existing scope and destination; saving updates and enables it while preserving its original follow date. Manage/pause subscriptions in the qbt-dl GUI's Following view for that daemon.
+
+Daemon calls always use `GM_xmlhttpRequest` with bearer authentication and no cookies, independently of the qBittorrent Fetch Mode setting. Allow the daemon host when Tampermonkey requests permission. There is no need to enable browser CORS on the daemon. The [Tampermonkey request documentation](https://www.tampermonkey.net/documentation.php#api:GM_xmlhttpRequest) describes this transport. The bearer token is stored locally in Tampermonkey, just like the existing qBittorrent credentials; use HTTPS or a trusted private network.
+
 ### Remote qBittorrent Server
 
 If your qBittorrent runs on a different machine:
@@ -77,6 +109,7 @@ Once installed and configured, the script automatically:
 2. **Torrent Files** - When you click a link to a `.torrent` file, it's downloaded using your current session cookies and sent to qBittorrent
 
 The confirmation dialog offers a choice:
+- **Add & follow TV show…** - When daemon integration is enabled, choose a catalog show, destination and monitoring scope before adding and following
 - **Add to qBittorrent** - Send the torrent/magnet to your qBittorrent server (the primary action)
 - **⬇️ Download File** - Save the `.torrent` file directly to your computer (for torrent file links)
 - **🧲 Open in App** - Hand the magnet link off to your system's default torrent client (for magnet links)
@@ -92,6 +125,7 @@ Click the Tampermonkey icon to access:
 - **Configure qBittorrent** - Open settings dialog (includes Quick Actions for Force Re-login, Open Web UI, Sign in via Web UI, plus Fetch Mode and Debug Logging toggles)
 - **Add Torrent by URL** - Manually enter a magnet or torrent URL
 - **Test Connection** - Verify qBittorrent connectivity
+- **Follow TV show with qbt-dl** - Follow or update a show without adding another torrent (opens setup if integration is disabled)
 
 ### Authenticated Sites
 
@@ -156,6 +190,18 @@ If the automatic sign-in fails (e.g. wrong credentials), the qBittorrent tab sta
 - Your qBittorrent credentials are stored locally by Tampermonkey using `GM_setValue`
 - The `@connect *` permission allows the script to connect to any host (required for various torrent sites)
 - Never share your configured Tampermonkey script as it may contain your credentials
+
+## Development
+
+Install the test dependencies using a Node.js version supported by `package.json`:
+
+```sh
+npm ci
+npm run check
+npm test
+```
+
+Tests run the userscript dialogs in jsdom with mocked Tampermonkey and daemon APIs. They cover authentication errors, all monitoring scopes, existing subscriptions, failed additions, follow retries, settings, search races, and untrusted titles without contacting a real server.
 
 ## License
 

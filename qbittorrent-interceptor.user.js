@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         qBittorrent Torrent Interceptor
 // @namespace    https://github.com/joshkerr/qbit-tampermonkey
-// @version      1.12.0
-// @description  Intercept torrent downloads and magnet links, send them to qBittorrent or download locally
+// @version      1.13.0
+// @description  Intercept torrent downloads and magnet links, send them to qBittorrent, follow TV shows with qbt-dl, or download locally
 // @author       joshkerr
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -32,6 +32,13 @@
             get url() { return GM_getValue('qbit_url', 'http://localhost:8080'); },
             get username() { return GM_getValue('qbit_username', 'admin'); },
             get password() { return GM_getValue('qbit_password', 'adminadmin'); },
+        },
+        // Optional qbt-dl daemon. Its token is independent of qBittorrent login.
+        daemon: {
+            get enabled() { return GM_getValue('qbit_daemon_enabled', false); },
+            get url() { return GM_getValue('qbit_daemon_url', 'http://localhost:8791'); },
+            get token() { return GM_getValue('qbit_daemon_token', ''); },
+            get destination() { return GM_getValue('qbit_daemon_destination', ''); },
         },
         // Default save path (leave empty for qBittorrent default)
         get savePath() { return GM_getValue('qbit_savepath', ''); },
@@ -81,6 +88,9 @@
             border-radius: 12px;
             padding: 24px;
             max-width: 500px;
+            box-sizing: border-box;
+            max-height: 90vh;
+            overflow-y: auto;
             width: 90%;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
             color: #000;
@@ -103,7 +113,9 @@
             font-size: 14px;
         }
         .qbit-modal input[type="text"],
-        .qbit-modal input[type="password"] {
+        .qbit-modal input[type="password"],
+        .qbit-modal input[type="number"],
+        .qbit-modal select {
             width: 100%;
             padding: 10px 12px;
             border: 1px solid #ccc;
@@ -113,7 +125,9 @@
             margin-top: 4px;
         }
         .qbit-modal-dark input[type="text"],
-        .qbit-modal-dark input[type="password"] {
+        .qbit-modal-dark input[type="password"],
+        .qbit-modal-dark input[type="number"],
+        .qbit-modal-dark select {
             background: #2d2d2d;
             border-color: #444;
             color: #fff;
@@ -121,6 +135,7 @@
         .qbit-modal-buttons {
             display: flex;
             justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 10px;
         }
         .qbit-modal button {
@@ -131,6 +146,9 @@
             cursor: pointer;
             font-weight: 500;
         }
+        .qbit-modal button:disabled { opacity: 0.5; cursor: wait; }
+        .qbit-show-from:not([hidden]) { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .qbit-status { font-size: 13px; white-space: pre-line; overflow-wrap: anywhere; }
         .qbit-btn-primary {
             background: #2196F3;
             color: white;
@@ -317,6 +335,7 @@
     }
 
     // options.confirmLabel: text for the primary button (default "Add to qBittorrent")
+    // options.keepOpenOnConfirm / canClose: keep async forms open until they finish.
     // options.extraButtons: array of { label, className, onClick } shown between Cancel and Confirm.
     //   Each extra button closes the modal before invoking onClick.
     function showModal(title, content, onConfirm, onCancel, options = {}) {
@@ -348,11 +367,13 @@
         document.body.appendChild(overlay);
 
         const close = () => {
+            if (options.canClose && !options.canClose()) return false;
             document.removeEventListener('keydown', onKeydown, true);
             overlay.remove();
+            return true;
         };
         const cancel = () => {
-            close();
+            if (!close()) return;
             if (onCancel) onCancel();
         };
         const onKeydown = (e) => {
@@ -364,7 +385,7 @@
         document.addEventListener('keydown', onKeydown, true);
 
         confirmBtn.onclick = () => {
-            close();
+            if (!options.keepOpenOnConfirm) close();
             if (onConfirm) onConfirm();
         };
 
@@ -385,7 +406,7 @@
             if (e.target === overlay) cancel();
         };
 
-        return { close };
+        return { close, modal };
     }
 
     function showConfigModal() {
@@ -419,6 +440,20 @@
                     <input type="text" id="qbit-cfg-category" value="${escapeHtml(CONFIG.category)}">
                 </label>
                 <hr class="qbit-actions-divider">
+                <div class="qbit-actions-header">qbt-dl TV subscriptions</div>
+                <label><input type="checkbox" id="qbit-cfg-daemon-enabled" ${CONFIG.daemon.enabled ? 'checked' : ''}> Offer to follow TV shows</label>
+                <label>Daemon URL:
+                    <input type="text" id="qbit-cfg-daemon-url" value="${escapeHtml(CONFIG.daemon.url)}" placeholder="http://mediaserver:8791">
+                </label>
+                <label>Daemon token:
+                    <input type="password" id="qbit-cfg-daemon-token" value="${escapeHtml(CONFIG.daemon.token)}" autocomplete="off">
+                </label>
+                <label>Default destination on daemon:
+                    <select id="qbit-cfg-daemon-destination"></select>
+                </label>
+                <button class="qbit-action-btn" id="qbit-act-daemon-test">Test daemon &amp; load destinations</button>
+                <p class="qbit-status" id="qbit-daemon-status" role="status">Use the URL and token printed by qbt-dl daemon. Configure its catalog, sources and destinations first.</p>
+                <hr class="qbit-actions-divider">
                 <div class="qbit-actions-header">Quick Actions</div>
                 <div class="qbit-actions-grid">
                     <button class="qbit-action-btn" id="qbit-act-relogin">🔄 Force Re-login</button>
@@ -444,6 +479,37 @@
 
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
+
+        const daemonDestination = modal.querySelector('#qbit-cfg-daemon-destination');
+        daemonDestination.add(new Option(CONFIG.daemon.destination || 'Choose when following', CONFIG.daemon.destination));
+        let destinationConnection = JSON.stringify([CONFIG.daemon.url, CONFIG.daemon.token]);
+        const daemonSettings = () => ({
+            url: modal.querySelector('#qbit-cfg-daemon-url').value.trim(),
+            token: modal.querySelector('#qbit-cfg-daemon-token').value.trim(),
+        });
+        modal.querySelector('#qbit-act-daemon-test').onclick = async (event) => {
+            const button = event.currentTarget;
+            const status = modal.querySelector('#qbit-daemon-status');
+            button.disabled = true;
+            status.textContent = 'Connecting…';
+            const settings = daemonSettings();
+            try {
+                const state = await loadDaemonState(settings);
+                if (JSON.stringify(daemonSettings()) !== JSON.stringify(settings)) {
+                    status.textContent = 'Settings changed. Test the connection again.';
+                    return;
+                }
+                daemonDestination.replaceChildren(new Option('Choose when following', ''));
+                state.destinations.forEach(path => daemonDestination.add(new Option(path, path)));
+                if (state.destinations.includes(CONFIG.daemon.destination)) daemonDestination.value = CONFIG.daemon.destination;
+                destinationConnection = JSON.stringify([settings.url, settings.token]);
+                status.textContent = `Connected. ${state.destinations.length} destination(s). ${daemonReadiness(state)}`;
+            } catch (error) {
+                status.textContent = error.message;
+            } finally {
+                button.disabled = false;
+            }
+        };
 
         // Quick action: Force Re-login
         modal.querySelector('#qbit-act-relogin').onclick = async () => {
@@ -499,6 +565,20 @@
             const savePath = modal.querySelector('#qbit-cfg-savepath').value;
             const category = modal.querySelector('#qbit-cfg-category').value;
 
+            const daemon = daemonSettings();
+            const daemonEnabled = modal.querySelector('#qbit-cfg-daemon-enabled').checked;
+            if (daemonEnabled) {
+                try { validateDaemonSettings(daemon); }
+                catch (error) {
+                    modal.querySelector('#qbit-daemon-status').textContent = error.message;
+                    return;
+                }
+            }
+            GM_setValue('qbit_daemon_enabled', daemonEnabled);
+            GM_setValue('qbit_daemon_url', daemon.url);
+            GM_setValue('qbit_daemon_token', daemon.token);
+            GM_setValue('qbit_daemon_destination', destinationConnection === JSON.stringify([daemon.url, daemon.token]) ? daemonDestination.value : '');
+
             GM_setValue('qbit_url', url);
             GM_setValue('qbit_username', username);
             GM_setValue('qbit_password', password);
@@ -530,6 +610,259 @@
         overlay.onclick = (e) => {
             if (e.target === overlay) closeConfig();
         };
+    }
+
+    // ============================================
+    // QBT-DL DAEMON / TV SUBSCRIPTIONS
+    // ============================================
+
+    function validateDaemonSettings(settings) {
+        let url;
+        try { url = new URL(settings.url); } catch (_) { /* handled below */ }
+        if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+            throw new Error('Enter an HTTP(S) daemon URL without credentials, query or fragment.');
+        }
+        if (!settings.token.trim() || /[\r\n]/.test(settings.token)) {
+            throw new Error('Enter the bearer token printed by qbt-dl daemon.');
+        }
+        return url.href.replace(/\/+$/, '');
+    }
+
+    function daemonRequest(command, settings) {
+        return new Promise((resolve, reject) => {
+            const base = validateDaemonSettings(settings);
+            // Always use the userscript transport: no page CORS changes or qBittorrent cookies.
+            // Explicit timeout also covers managers whose fetch transport ignores timeout.
+            let request;
+            const timer = setTimeout(() => {
+                reject(new Error('qbt-dl request timed out. Check the daemon URL and network.'));
+                if (request && request.abort) request.abort();
+            }, REQUEST_TIMEOUT_MS);
+            const fail = message => { clearTimeout(timer); reject(new Error(message)); };
+            try {
+                request = GM_xmlhttpRequest({
+                    method: command ? 'POST' : 'GET',
+                    url: `${base}/api/v1/library`,
+                    headers: { Authorization: `Bearer ${settings.token.trim()}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+                    data: command ? JSON.stringify(command) : undefined,
+                    anonymous: true,
+                    redirect: 'error',
+                    timeout: REQUEST_TIMEOUT_MS,
+                    onload: response => {
+                        clearTimeout(timer);
+                        if (response.status === 401 || response.status === 403) {
+                            return fail('qbt-dl rejected the token. Check the daemon settings.');
+                        }
+                        if (response.status === 404) return fail('Library API not found. Use qbt-dl 3.4.0 or newer and its daemon base URL.');
+                        let result;
+                        try { result = JSON.parse(response.responseText); }
+                        catch (_) { return fail('qbt-dl returned an invalid response. Check the URL and reverse proxy.'); }
+                        if (response.status < 200 || response.status >= 300) {
+                            return fail(typeof result?.error === 'string' ? result.error : `qbt-dl returned HTTP ${response.status}.`);
+                        }
+                        if (!result || typeof result !== 'object' || Array.isArray(result)) return fail('Invalid qbt-dl API response.');
+                        resolve(result);
+                    },
+                    onerror: () => fail('Cannot reach qbt-dl. Check the URL, network and Tampermonkey host permission; use the final URL without redirects.'),
+                    ontimeout: () => fail('qbt-dl request timed out. Check the daemon URL and network.'),
+                    onabort: () => fail('qbt-dl request was cancelled.'),
+                });
+            } catch (_) {
+                fail('Cannot send the qbt-dl request. Check Tampermonkey host permissions.');
+            }
+        });
+    }
+
+    async function loadDaemonState(settings) {
+        const result = await daemonRequest(null, settings);
+        if (!result.state || !Array.isArray(result.state.destinations) || !result.state.destinations.every(path => typeof path === 'string')) {
+            throw new Error('Invalid library response. Use qbt-dl 3.4.0 or newer.');
+        }
+        return result.state;
+    }
+
+    function daemonReadiness(state) {
+        if (!state.destinations.length) return 'Add a destination on the daemon before following a show.';
+        if (!(state.sources || []).some(source => source.enabled)) return 'No enabled sources. Add an RSS/Torznab source on this daemon to acquire episodes.';
+        return 'The daemon will monitor its configured sources.';
+    }
+
+    // A hint only: users always select a catalog identity before subscribing.
+    function parseShowHint(name) {
+        const text = String(name || '').replace(/_/g, ' ');
+        const match = /\bS(\d{1,2})[ .-]?E(\d{1,3})\b|\b(\d{1,2})x(\d{1,3})\b|\b(?:S|Season[ .-]*)(\d{1,2})\b/i.exec(text);
+        const prefix = match ? text.slice(0, match.index) : text.replace(/\.torrent$/i, '');
+        return {
+            query: prefix.replace(/[.]+/g, ' ').replace(/[\s\[\]()_-]+$/g, '').trim(),
+            season: match ? Number(match[1] || match[3] || match[5]) : 0,
+            episode: match ? Number(match[2] || match[4] || 1) : 1,
+        };
+    }
+
+    function showFollowModal(name = '', torrentUrl = null) {
+        if (!CONFIG.daemon.enabled) {
+            showConfigModal();
+            return;
+        }
+        // Keep one connection throughout the flow, even if another tab changes settings.
+        const settings = { url: CONFIG.daemon.url, token: CONFIG.daemon.token };
+        const hint = parseShowHint(name);
+        let state = null;
+        let titles = [];
+        let busy = false;
+        let torrentAdded = false;
+        let searchGeneration = 0;
+        let dialog;
+        const content = `
+            ${torrentUrl ? `<div class="qbit-torrent-name">${escapeHtml(name)}</div>` : ''}
+            <label>Show name:<input type="text" class="qbit-show-query" value="${escapeHtml(hint.query)}"></label>
+            <button class="qbit-btn-secondary qbit-show-search">Search shows</button>
+            <label>Confirm the show:<select class="qbit-show-title"><option value="">Search and choose a show</option></select></label>
+            <p class="qbit-status qbit-show-overview"></p>
+            <label>Destination on daemon:<select class="qbit-show-destination"></select></label>
+            <label>Episodes to follow:<select class="qbit-show-mode">
+                <option value="future">Future episodes only (airing from follow date)</option>
+                <option value="missing">All episodes (backfill missing + future)</option>
+                <option value="from">From a specific episode (including it)</option>
+            </select></label>
+            <div class="qbit-show-from" hidden>
+                <label>Starting season:<input type="number" min="1" step="1" class="qbit-show-season" value="${hint.season || 1}"></label>
+                <label>Starting episode:<input type="number" min="1" step="1" class="qbit-show-episode" value="${hint.episode}"></label>
+            </div>
+            <p class="qbit-status qbit-show-existing"></p>
+            <p class="qbit-status qbit-show-scope-hint"></p>
+            <p class="qbit-status">${torrentUrl ? 'This torrent goes to qBittorrent as usual. ' : ''}Following lets the daemon find releases through its configured sources and transfer them to this destination. It does not automatically import the torrent you clicked.</p>
+            <p class="qbit-status qbit-show-status" role="status" aria-live="polite">Connecting to daemon…</p>
+        `;
+        dialog = showModal(torrentUrl ? 'Add torrent & follow TV show' : 'Follow TV show', content, submit, null, {
+            confirmLabel: torrentUrl ? 'Add & follow' : 'Follow show',
+            keepOpenOnConfirm: true,
+            canClose: () => !busy,
+        });
+        const modal = dialog.modal;
+        const find = selector => modal.querySelector(selector);
+        const query = find('.qbit-show-query');
+        const searchButton = find('.qbit-show-search');
+        const titleSelect = find('.qbit-show-title');
+        const destination = find('.qbit-show-destination');
+        const mode = find('.qbit-show-mode');
+        const season = find('.qbit-show-season');
+        const episode = find('.qbit-show-episode');
+        const status = find('.qbit-show-status');
+        const confirm = find('.qbit-confirm');
+        const selectedTitle = () => titles.find(title => String(title.id) === titleSelect.value);
+        const updateConfirm = () => { confirm.disabled = busy || !state || !selectedTitle() || !destination.value; };
+        const updateMode = () => {
+            find('.qbit-show-from').hidden = mode.value !== 'from';
+            find('.qbit-show-scope-hint').textContent = {
+                future: "Episodes airing on or after the subscription's UTC calendar date.",
+                missing: 'Fill missing aired episodes across all seasons and keep following new episodes.',
+                from: 'Include this episode and later episodes and seasons.',
+            }[mode.value];
+        };
+        mode.onchange = updateMode;
+        destination.onchange = updateConfirm;
+        titleSelect.onchange = () => {
+            const title = selectedTitle();
+            const existing = (state?.subscriptions || []).find(sub => sub.title.kind === 'tv' && sub.title.id === title?.id);
+            find('.qbit-show-overview').textContent = title?.overview || '';
+            find('.qbit-show-existing').textContent = existing
+                ? `Already followed${existing.enabled ? '' : ' (paused)'}. Saving updates and enables this subscription; its original follow date is retained.` : '';
+            mode.value = existing?.mode || 'future';
+            season.value = existing?.fromSeason || hint.season || 1;
+            episode.value = existing?.fromEpisode || hint.episode;
+            const preferred = existing?.destination || CONFIG.daemon.destination;
+            destination.value = state?.destinations.includes(preferred) ? preferred : (state?.destinations[0] || '');
+            confirm.textContent = torrentUrl ? 'Add & follow' : existing ? 'Update follow' : 'Follow show';
+            if (state) status.textContent = `${title ? 'Ready to save. ' : 'Select the matching show. '}${daemonReadiness(state)}`;
+            updateMode();
+            updateConfirm();
+        };
+        query.oninput = () => {
+            searchGeneration++;
+            titles = [];
+            titleSelect.replaceChildren(new Option('Search and choose a show', ''));
+            find('.qbit-show-overview').textContent = '';
+            find('.qbit-show-existing').textContent = '';
+            updateConfirm();
+        };
+        async function search() {
+            const searchText = query.value.trim();
+            if (!searchText || busy) return;
+            const generation = ++searchGeneration;
+            titles = [];
+            titleSelect.replaceChildren(new Option('Searching…', ''));
+            updateConfirm();
+            status.textContent = 'Searching TV catalog…';
+            try {
+                // Also retries initialization after a transient connection failure.
+                if (!state) {
+                    const loaded = await loadDaemonState(settings);
+                    if (generation !== searchGeneration || !modal.isConnected) return;
+                    state = loaded;
+                    destination.replaceChildren(...state.destinations.map(path => new Option(path, path)));
+                    if (state.destinations.includes(CONFIG.daemon.destination)) destination.value = CONFIG.daemon.destination;
+                }
+                const result = await daemonRequest({ action: 'discover', query: searchText, kind: 'tv' }, settings);
+                if (generation !== searchGeneration || !modal.isConnected) return;
+                titles = (result.titles || []).filter(title => title.kind === 'tv' && Number.isInteger(title.id) && title.id > 0 && typeof title.name === 'string');
+                titleSelect.replaceChildren(new Option('Choose the matching show', ''), ...titles.map(title => new Option(`${title.name}${title.year ? ` (${title.year})` : ''}`, String(title.id))));
+                status.textContent = `${titles.length ? 'Select the matching show.' : 'No shows found. Try another name.'} ${daemonReadiness(state)}`;
+            } catch (error) {
+                if (generation === searchGeneration && modal.isConnected) status.textContent = error.message;
+            } finally {
+                updateConfirm();
+            }
+        }
+        searchButton.onclick = search;
+        query.onkeydown = event => {
+            if (event.key === 'Enter') { event.preventDefault(); search(); }
+        };
+        async function submit() {
+            const title = selectedTitle();
+            if (busy || !state || !title || !state.destinations.includes(destination.value)) return;
+            const fromSeason = Number(season.value);
+            const fromEpisode = Number(episode.value);
+            if (mode.value === 'from' && (!Number.isSafeInteger(fromSeason) || !Number.isSafeInteger(fromEpisode) || fromSeason < 1 || fromEpisode < 1)) {
+                status.textContent = 'Enter a whole starting season and episode, both at least 1.';
+                return;
+            }
+            const subscription = { title, destination: destination.value, enabled: true, mode: mode.value, fromSeason, fromEpisode };
+            busy = true;
+            updateConfirm();
+            const fields = [...modal.querySelectorAll('input, select, .qbit-show-search, .qbit-cancel')];
+            fields.forEach(field => { field.disabled = true; });
+            try {
+                if (torrentUrl && !torrentAdded) {
+                    status.textContent = 'Adding torrent to qBittorrent…';
+                    // Keep Safari's login initiation inside this user gesture.
+                    if (!await signInFromGestureIfNeeded()) throw new Error('qBittorrent sign-in did not finish. Nothing was followed. Try again.');
+                    torrentAdded = isMagnetUrl(torrentUrl)
+                        ? await addTorrentByUrl(torrentUrl, name)
+                        : await handleTorrentDownload(torrentUrl, extractTorrentName(torrentUrl) + '.torrent');
+                    if (!torrentAdded) throw new Error('Torrent was not added. Nothing was followed. Check qBittorrent and try again.');
+                }
+                status.textContent = 'Saving follow on daemon…';
+                await daemonRequest({ action: 'subscribe', subscription }, settings);
+                GM_setValue('qbit_daemon_destination', subscription.destination);
+                busy = false;
+                dialog.close();
+                showToast(`Following ${title.name} with qbt-dl`, 'success');
+            } catch (error) {
+                status.textContent = `${torrentAdded ? 'Torrent added to qBittorrent. Follow could not be confirmed; retry safely without re-adding the torrent. ' : ''}${error.message}`;
+                if (torrentAdded) confirm.textContent = 'Retry follow';
+            } finally {
+                busy = false;
+                // After a successful add, keep the selected identity/scope fixed for retries.
+                fields.forEach(field => { field.disabled = torrentAdded && !field.matches('.qbit-cancel'); });
+                updateConfirm();
+            }
+        }
+        updateMode();
+        updateConfirm();
+        // Search is explicit for empty titles; no arbitrary catalog match is selected.
+        if (query.value.trim()) search();
+        else status.textContent = 'Enter a show name and search to load the daemon catalog and destinations.';
     }
 
     // ============================================
@@ -1575,14 +1908,13 @@
                 // URL itself rather than uploading garbage
                 debugLog('Downloaded file is not bencoded, trying URL method');
                 showToast('Tracker sent a non-torrent response (login page?), trying URL method...', 'info');
-                await addTorrentByUrl(url, fileName);
-                return;
+                return await addTorrentByUrl(url, fileName);
             }
-            await addTorrentByFile(blob, fileName);
+            return await addTorrentByFile(blob, fileName);
         } catch (error) {
             // If download failed, try adding by URL (qBittorrent will download it)
             debugLog('Direct download failed, trying URL method:', error);
-            await addTorrentByUrl(url, fileName);
+            return await addTorrentByUrl(url, fileName);
         }
     }
 
@@ -1677,8 +2009,10 @@
         return !!url && String(url).toLowerCase().startsWith('magnet:');
     }
 
-    function handleLink(url, event) {
+    function handleLink(url, event, linkName = '') {
         const torrentName = extractTorrentName(url);
+        // Link text/title often carries the release name on download.php URLs.
+        const followName = [torrentName, linkName, document.title].find(name => parseShowHint(name).season) || linkName || torrentName;
 
         if (CONFIG.showConfirmation) {
             event.preventDefault();
@@ -1703,6 +2037,9 @@
                     onClick: () => handleLocalDownload(url, torrentName + '.torrent')
                   }];
 
+            if (CONFIG.daemon.enabled) {
+                extraButtons.push({ label: 'Add & follow TV show…', onClick: () => showFollowModal(followName, url) });
+            }
             prewarmSafariSession();
             showModal('🧲 Add Torrent', content, async () => {
                 // Runs synchronously inside the tap: may open the sign-in tab
@@ -1753,7 +2090,7 @@
             const url = target.href;
 
             if (isMagnetUrl(url) || isTorrentUrl(url)) {
-                handleLink(url, event);
+                handleLink(url, event, target.getAttribute('title') || target.textContent.trim());
             }
         }, true); // Use capture phase to intercept before other handlers
     }
@@ -1766,27 +2103,7 @@
             if (isMagnetUrl(url)) {
                 // Coerce - pages may pass a URL object instead of a string
                 const magnetUrl = String(url);
-                const torrentName = extractTorrentName(magnetUrl);
-                if (CONFIG.showConfirmation) {
-                    const content = `
-                        <p>Send this to qBittorrent?</p>
-                        <div class="qbit-torrent-name">${escapeHtml(torrentName)}</div>
-                    `;
-                    prewarmSafariSession();
-                    showModal('🧲 Add Torrent', content, async () => {
-                        if (!await signInFromGestureIfNeeded()) return;
-                        await addTorrentByUrl(magnetUrl, torrentName);
-                    }, null, {
-                        extraButtons: [{
-                            label: '🧲 Open in App',
-                            onClick: () => { window.location.href = magnetUrl; }
-                        }]
-                    });
-                } else {
-                    signInFromGestureIfNeeded().then((ok) => {
-                        if (ok) addTorrentByUrl(magnetUrl, torrentName);
-                    });
-                }
+                handleLink(magnetUrl, { preventDefault() {}, stopPropagation() {} });
                 return null;
             }
             return originalOpen.call(this, url, ...args);
@@ -1813,13 +2130,11 @@
         const input = prompt('Enter torrent URL or magnet link:');
         const url = input && input.trim();
         if (url) {
-            if (isMagnetUrl(url)) {
-                addTorrentByUrl(url, extractTorrentName(url));
-            } else {
-                handleTorrentDownload(url, extractTorrentName(url) + '.torrent');
-            }
+            handleLink(url, { preventDefault() {}, stopPropagation() {} });
         }
     });
+
+    GM_registerMenuCommand('📺 Follow TV show with qbt-dl', () => showFollowModal(document.title));
 
     GM_registerMenuCommand('🔌 Test Connection', async () => {
         showToast('Testing connection...', 'info');
